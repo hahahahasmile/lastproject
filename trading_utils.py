@@ -126,3 +126,64 @@ def simulate_trade(df, start_ts, end_ts, side,
     net_ret = gross_ret - fee_total
 
     return exit_time, float(exit_fill), float(gross_ret), float(net_ret)
+
+
+def _round_step(x: float, step: float) -> float:
+    if step <= 0:
+        return x
+    return float(int(round(x / step)) * step)
+
+def place_futures_market_bracket(
+    client,
+    symbol: str,
+    side: str,               # "LONG" | "SHORT"
+    qty: float,              # 계약수량(컨트랙트)
+    entry_price_ref: float,  # 참고용(로그용)
+    sl_price: float | None,
+    tp_price: float | None,
+    qty_step: float,
+    tick_size: float,
+):
+    """
+    실계정에 시장가 진입 + TP/SL(reduceOnly) 등록
+    """
+    if qty <= 0:
+        raise ValueError("qty must be positive")
+
+    open_side = "BUY" if side == "LONG" else "SELL"
+    close_side = "SELL" if side == "LONG" else "BUY"
+
+    qty = max(_round_step(qty, qty_step), qty_step)
+    if sl_price is not None:
+        sl_price = max(_round_step(sl_price, tick_size), tick_size)
+    if tp_price is not None:
+        tp_price = max(_round_step(tp_price, tick_size), tick_size)
+
+    # 1) 시장가 진입
+    od = client.futures_create_order(
+        symbol=symbol,
+        side=open_side,
+        type="MARKET",
+        quantity=qty,
+    )
+
+    # 2) TP/SL 등록 (둘 중 None 가능) — reduceOnly
+    if tp_price is not None:
+        client.futures_create_order(
+            symbol=symbol,
+            side=close_side,
+            type="TAKE_PROFIT_MARKET",
+            stopPrice=tp_price,
+            reduceOnly=True,
+            quantity=qty,
+        )
+    if sl_price is not None:
+        client.futures_create_order(
+            symbol=symbol,
+            side=close_side,
+            type="STOP_MARKET",
+            stopPrice=sl_price,
+            reduceOnly=True,
+            quantity=qty,
+        )
+    return od
