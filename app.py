@@ -47,30 +47,11 @@ colA, colB, colC = st.columns(3)
 with colA:
     sim_mode = st.radio("모드", ["NOW", "ROLLING", "LIVE"], index=0, horizontal=True)
 
-sim_engine = "DTW"
-w_dtw = 0.5
-thr = 3.0
-ratio_min = 1.5
-entry_rule = "다음봉 시가"
-
-sltp_method = "ATR"
-k_sl = 1.0
-k_tp = 3.0
-sl_pct = -0.015
-tp_pct = 0.03
-
-fee_entry  = 0.0004
-fee_exit   = 0.0005
-slip_entry = 0.0003
-slip_exit  = 0.0005
-
-equity = 1000.0
-risk_pct = 0.02
-fast = True
-max_leverage = 10.0
-max_notional = 100_000.0
-qty_step = 0.001
-tick_size = 0.1
+sim_engine = "DTW"; w_dtw = 0.5; thr = 3.0; ratio_min = 1.5; entry_rule = "다음봉 시가"
+sltp_method = "ATR"; k_sl = 1.0; k_tp = 3.0; sl_pct = -0.015; tp_pct = 0.03
+fee_entry = 0.0004; fee_exit = 0.0005; slip_entry = 0.0003; slip_exit = 0.0005
+equity = 1000.0; risk_pct = 0.02; fast = True
+max_leverage = 10.0; max_notional = 100_000.0; qty_step = 0.001; tick_size = 0.1
 
 # ---- NOW/ROLLING: 기존 전체 UI 노출 ----
 if sim_mode == "ROLLING":
@@ -121,7 +102,7 @@ now_ts = df_full["timestamp"].iloc[-1]
 (ref_start, ref_end), (pred_start, pred_end) = pick_blocks(now_ts, step_hours=step_hours)
 
 ROLL_START = pd.Timestamp("2025-01-01 00:00:00")
-train_end_ts = ROLL_START if (sim_mode == "ROLLING") else pred_start
+train_end_ts = ROLL_START 
 
 df_full = apply_static_zscore(df_full, GLOBAL_Z_COLS, train_end_ts)
 df_full = finalize_preprocessed(df_full, window_size)
@@ -272,86 +253,148 @@ delayTD = pd.Timedelta(hours=ENTRY_DELAY_HOURS)
 st.session_state["decision_logs"] = []
 
 # ================= NOW =================
+# ================= NOW =================
 if sim_mode == "NOW":
-    st.subheader("NOW: 유사 과거 1개 선택 → 28~72h 전 범위 스캔(4시간 블록)")
-
-    # 1) 유사 과거 후보
+    st.subheader("NOW: 28h 지연 엔트리 · 1회 거래")
     cands = get_candidates(df_full, (ref_start, ref_end), ex_margin_days=exd, topN=topN, past_only=False)
-    cands = [c for c in cands if c.get("sim", 0.0) >= 0.5]
 
-    if not cands:
-        st.warning("유사도 ≥ 0.75 인 과거 후보가 없습니다.")
+    current_price = float(df_full['close'].iloc[-1])
+    results = []
+    for f in cands:
+        next_start = f["end"]; next_end = next_start + stepTD
+        df_next = df_full[(df_full["timestamp"] >= next_start) & (df_full["timestamp"] < next_end)]
+        if len(df_next) < window_size:
+            continue
+        closes = df_next["close"].to_numpy()
+        base = float(df_next["open"].iloc[0])  
+        pct = (closes - base) / base * 100.0 
+        pct_adj = adjust_pct_by_price_level(current_price, base, pct, ratio_min=ratio_min)
+        results.append({"sim":f["sim"], "next_start":next_start, "next_end":next_end, "pct":pct_adj})
+
+    t_entry = pred_start + delayTD
+    if now_ts < t_entry:
+        st.info(f"데이터 부족: 엔트리 고려 시점({t_entry})까지 28h가 지나지 않음.")
         st.stop()
 
-    cand = cands[0]  # 가장 유사한 1개
-    st.markdown(f"- 선택된 과거 블록: **{cand['start']} ~ {cand['end']}** (sim={cand['sim']:.3f})")
+    cur_pred_seg = df_full[
+    (df_full["timestamp"] >= pred_start) &
+    (df_full["timestamp"] <= min(now_ts, pred_end))
+    ]
+    
+    if len(cur_pred_seg)==0 or len(results)==0:
+        st.info("데이터 부족"); st.stop()
+    base_cur = float(cur_pred_seg["open"].iloc[0])   # ← 첫 시가
+    a_plot = ((cur_pred_seg["close"] - base_cur) / base_cur * 100.0).to_numpy(dtype=float)
+    prefix_end = min(t_entry, pred_end)
+    cur_prefix = cur_pred_seg[cur_pred_seg["timestamp"] <= prefix_end]
+    a = ((cur_prefix["close"] - base_cur) / base_cur * 100.0).to_numpy(dtype=float)
+    L = len(a)
 
-    # 2) 과거 예측 블록(다음 72h)과 현재 예측 블록(금번 72h)
-    past_pred_start = cand["end"]
-    past_pred_end   = past_pred_start + stepTD
-    df_past_pred = df_full[(df_full["timestamp"] >= past_pred_start) & (df_full["timestamp"] < past_pred_end)].reset_index(drop=True)
+    best = None
+    for r in results:
+        b = np.array(r["pct"], dtype=float)[:L]
+        sim_shape = 1.0 if (np.allclose(a,0) and np.allclose(b,0)) else float(cosine_similarity([a],[b])[0][0])
+        if (best is None) or (sim_shape > best["sim"]):
+            best = {"sim": sim_shape, "flow": r}
+    hist_full = np.array(best["flow"]["pct"], dtype=float)
 
-    cur_pred_start = pred_start
-    cur_pred_end   = pred_end
-    df_now_pred = df_full[(df_full["timestamp"] >= cur_pred_start) & (df_full["timestamp"] < cur_pred_end)].reset_index(drop=True)
+    # === (추가) 표도 베스트 후보와 동일 블록을 보게 만든다 ===
+    best_start = best["flow"]["next_start"]
+    best_end   = best_start + stepTD
+    df_best_next = df_full[(df_full["timestamp"] >= best_start) & (df_full["timestamp"] < best_end)]
 
-    if len(df_past_pred) < window_size or len(df_now_pred) == 0:
-        st.error("예측 블록 데이터가 부족합니다.")
-        st.stop()
+    side, max_up, max_down = decide_from_future_path(hist_full, L_prefix=L, thr_pct=thr)
+    if best["sim"] < 0.75:
+        side = "HOLD"
+    st.session_state["decision_logs"].append({
+        "mode": sim_engine, "w_dtw": w_dtw, "ratio_min": ratio_min, "thr_pct": thr,
+        "L_prefix": L, "ref_start": ref_start, "ref_end": ref_end,
+        "pred_start": pred_start, "pred_end": pred_end,
+        "best_sim_prefix": float(best["sim"]), "max_up": max_up, "max_down": max_down,
+        "decision": side
+    })
+    st.write(f"엔트리 기준시점: **{t_entry}** · 신호: **{side}** · 유사도(프리픽스)={best['sim']:.2f}")
 
-    # 3) 퍼센트 표(앵커 = 각 블록의 0~4h 시가)
-    past_pct_tbl = _make_percent_table_from_block(df_past_pred)
-    now_pct_tbl  = _make_percent_table_from_block(df_now_pred)
+    # ===== (기존) 실제 진입값/시뮬레이션 계산 =====
+    entry_time, entry_price = make_entry_at(df_full, t_entry, rule=entry_rule)
+    if entry_time is not None and entry_time < t_entry:
+        seg_after = df_full[df_full["timestamp"] > t_entry]
+        if not seg_after.empty:
+            entry_time = seg_after["timestamp"].iloc[0]
+            entry_price = float(seg_after["open"].iloc[0])
 
-    # 현재 표는 '완료된 봉까지만' 채우고, 미래 봉은 공백
-    # (데이터프레임 행수를 18로 맞추고, 부족분은 NaN 유지)
-    if len(now_pct_tbl) < window_size:
-        pad = pd.DataFrame({
-            "k": np.arange(len(now_pct_tbl), window_size, dtype=int),
-            "r_open_%":  np.nan, "r_close_%": np.nan, "r_high_%": np.nan, "r_low_%": np.nan
-        })
-        now_pct_tbl = pd.concat([now_pct_tbl, pad], ignore_index=True)
+    atr_ref = float(df_full.loc[df_full["timestamp"]==entry_time, "atr"].fillna(method='ffill').iloc[0]) if entry_time is not None else None
+    sl, tp = make_sl_tp(entry_price, side, method=sltp_method,
+                        atr=atr_ref, sl_pct=sl_pct, tp_pct=tp_pct,
+                        k_sl=k_sl, k_tp=k_tp, tick_size=tick_size) if side!="HOLD" else (None, None)
 
-    with st.expander("📊 과거_퍼센트표 (앵커=과거 0~4h 시가)", expanded=False):
-        st.dataframe(past_pct_tbl, use_container_width=True)
-    with st.expander("📊 현재_퍼센트표 (앵커=현재 0~4h 시가, 미완료 봉=공백)", expanded=False):
-        st.dataframe(now_pct_tbl, use_container_width=True)
+    exit_time, exit_price, gross_ret, net_ret = (None, None, None, None)
+    size = 0.0
+    if side!="HOLD" and entry_price and sl:
+        size = position_size(equity, risk_pct, entry_price, sl,
+                             contract_value=1.0, max_leverage=max_leverage,
+                             max_notional=max_notional, qty_step=qty_step)
+    if side!="HOLD":
+        exit_time, exit_price, gross_ret, net_ret = simulate_trade(
+            df_full, t_entry, pred_end, side,
+            entry_time, entry_price, sl, tp,
+            fee_entry=fee_entry, fee_exit=fee_exit,
+            slip_entry=slip_entry, slip_exit=slip_exit
+        )
+    
+    # ===== 퍼센트 표(앵커=각 블록 첫 시가) =====
+    past_pct_tbl = pd.DataFrame({
+        "k": np.arange(len(df_best_next), dtype=int),
+        "r_open_%":  (df_best_next['open']  / df_best_next['open'].iloc[0] - 1.0) * 100.0,
+        "r_close_%": (df_best_next['close'] / df_best_next['open'].iloc[0] - 1.0) * 100.0,
+        "r_high_%":  (df_best_next['high']  / df_best_next['open'].iloc[0] - 1.0) * 100.0,
+        "r_low_%":   (df_best_next['low']   / df_best_next['open'].iloc[0] - 1.0) * 100.0,
+    }).reset_index(drop=True)
 
-    # 4) 28~72 전 범위 스캔 (진입=시가, 청산=해당+다음3 블록 종가, 총 32개)
-    scan_df, best = _scan_segments_28_72(df_past_pred, thr_abs_pct=2.0)
+    now_pct_tbl = pd.DataFrame({
+        "k": np.arange(len(cur_pred_seg), dtype=int),
+        "r_open_%":  (cur_pred_seg['open']  / cur_pred_seg['open'].iloc[0] - 1.0) * 100.0,
+        "r_close_%": (cur_pred_seg['close'] / cur_pred_seg['open'].iloc[0] - 1.0) * 100.0,
+        "r_high_%":  (cur_pred_seg['high']  / cur_pred_seg['open'].iloc[0] - 1.0) * 100.0,
+        "r_low_%":   (cur_pred_seg['low']   / cur_pred_seg['open'].iloc[0] - 1.0) * 100.0,
+    }).reset_index(drop=True)
+    
+    # ===== 전 범위 스캔(과거 예측 블록) =====
+    scan_df, best_scan = _scan_segments_28_72(df_best_next, thr_abs_pct=2.0)
 
-    with st.expander("🧮 스캔요약표 (8개 진입 × 4개 청산 = 최대 32개)", expanded=True):
-        st.dataframe(scan_df, use_container_width=True)
-
-    if not best.get("ok", False):
+    if not best_scan.get("ok", False):
         st.info("최대 |Δ%| < 2.0% (이상 기준 미충족) → 거래 시작 조건 불만족")
-        st.stop()
+        # 계속 진행해도 표시는 가능하도록 중단하지 않음
 
-    # 5) 최종 선택(방향/진입·청산/Δ%) 및 현재로 환산
-    entry_k, exit_k = best["entry_k"], best["exit_k"]
-    side = best["side"]
-    delta_pct = best["delta_pct"]
-    p_entry_pct = best["p_entry_pct"]
-    p_extreme_pct = best["p_extreme_pct"]  # LONG: peak, SHORT: trough
+    entry_k = best_scan["entry_k"]
+    exit_k = best_scan["exit_k"]
+    delta_pct = best_scan["delta_pct"]
+    p_entry_pct = best_scan["p_entry_pct"]
+    p_extreme_pct = best_scan["p_extreme_pct"]
 
-    O_anchor_now = float(df_now_pred['open'].iloc[0])
-    entry_now  = O_anchor_now * (1.0 + p_entry_pct   / 100.0)
-    extreme_now= O_anchor_now * (1.0 + p_extreme_pct / 100.0)
+    # =======================
+    # DISPLAY-ONLY: 예측 표시값 (앵커 매핑) — HOLD여도 항상 표기
+    # =======================
+    O_anchor_now  = float(cur_pred_seg['open'].iloc[0])    # 현재 예측 블록의 0~4h 시가(앵커)
+    O_anchor_past = float(df_best_next['open'].iloc[0])      # 과거 예측 블록의 0~4h 시가(앵커)
 
-    # ATR은 '현재 예측 블록' 내 마지막 완료 봉 기준으로 사용
-    atr_now = float(df_now_pred['atr'].dropna().iloc[-1]) if 'atr' in df_now_pred.columns and df_now_pred['atr'].notna().any() else np.nan
-    tp, sl = (np.nan, np.nan)
-    try:
-        if side == "LONG":
-            tp = entry_now + k_tp * atr_now
-            sl = entry_now - k_sl * atr_now
-        elif side == "SHORT":
-            tp = entry_now - k_tp * atr_now
-            sl = entry_now + k_sl * atr_now
-    except Exception:
-        pass
+    # Entry_now: 진입블록 시가를 앵커 퍼센트로 현재에 적용 (스캔에서 얻은 p_entry_pct 사용)
+    Entry_now = O_anchor_now * (1.0 + p_entry_pct / 100.0)
 
-    # 6) 출력(최종선택 요약)
+    # 진입/청산 블록의 시간 (현재 예측 블록의 타임라인 기준)
+    entry_time_pred = pred_start + pd.Timedelta(hours=4*int(entry_k))          # 진입블록 시작시간
+    exit_time_pred  = pred_start + pd.Timedelta(hours=4*(int(exit_k)+1))       # 청산블록 끝시간
+
+    # 청산 종가/고가 퍼센트 → 현재 앵커로 매핑
+    close_exit_past = float(df_best_next['close'].iloc[int(exit_k)])
+    high_exit_past  = float(df_best_next['high'].iloc[int(exit_k)])
+    p_exit_pct      = (close_exit_past / O_anchor_past - 1.0) * 100.0
+    p_exit_max_pct  = (high_exit_past  / O_anchor_past - 1.0) * 100.0
+    exit_pred       = O_anchor_now * (1.0 + p_exit_pct / 100.0)
+    exit_max_pred   = O_anchor_now * (1.0 + p_exit_max_pct / 100.0)
+    # =======================
+
+    # ===== 최종선택(표시) =====
     st.markdown("### ✅ 최종선택")
     st.write({
         "방향": side,
@@ -359,23 +402,100 @@ if sim_mode == "NOW":
         "청산블록_k": int(exit_k),
         "Δ% (ExitClose/EntryOpen-1)*100": float(delta_pct),
         "p_entry% (앵커대비)": float(p_entry_pct),
-        "p_extreme% (앵커대비)": float(p_extreme_pct),  # LONG: peak, SHORT: trough
-        "Entry_now": float(entry_now),
-        ("Peak_now" if side=="LONG" else "Trough_now"): float(extreme_now),
-        "ATR_now": float(atr_now) if not np.isnan(atr_now) else None,
-        "TP": float(tp) if not np.isnan(tp) else None,
-        "SL": float(sl) if not np.isnan(sl) else None,
+        "p_extreme% (앵커대비)": float(p_extreme_pct),
+        "p_exit_%": float(p_exit_pct), 
+        "Entry_now": float(Entry_now),
+        "ATR_now": float(cur_pred_seg['atr'].dropna().iloc[-1]) if ('atr' in cur_pred_seg.columns and cur_pred_seg['atr'].notna().any()) else None,
+        "TP": None,   # 요구대로 HOLD 시 예측 TP/SL은 채우지 않음
+        "SL": None,
     })
 
-    # 7) 시각화(한 장) — 현재 vs 과거(앵커 기준 r_close_% 라인)
-    fig, ax = plt.subplots(figsize=(10, 3.2))
-    ax.plot(past_pct_tbl["k"], past_pct_tbl["r_close_%"], label="과거(예측블록) r_close_%", linewidth=2)
-    ax.plot(now_pct_tbl["k"],  now_pct_tbl["r_close_%"],  label="현재(예측블록) r_close_%", linewidth=2, alpha=0.8)
-    ax.axvline(entry_k, color="gray", linestyle="--", linewidth=1)
-    ax.axvline(exit_k,  color="gray", linestyle="--", linewidth=1)
-    ax.set_title("현재 vs 가장 유사한 과거 (앵커 기준 퍼센트 라인)")
-    ax.grid(True, alpha=0.3); ax.legend()
+    with st.expander("📊 과거_퍼센트표 (앵커=과거 0~4h 시가)", expanded=False):
+        st.dataframe(past_pct_tbl, use_container_width=True)
+
+    with st.expander("📊 현재_퍼센트표 (앵커=현재 0~4h 시가, 미완료 봉=공백)", expanded=False):
+        st.dataframe(now_pct_tbl, use_container_width=True)
+
+    with st.expander("🧮 스캔요약표 (8개 진입 × 4개 청산 = 최대 32개)", expanded=True):
+        st.dataframe(scan_df, use_container_width=True)
+
+    # ===== 거래 결과 (표시) — 예측 기준으로 치환 출력 (HOLD여도 값 보이게) =====
+    st.markdown("#### 거래 결과 (블록당 최대 1회)")
+    st.write({
+        "entry_time": entry_time_pred,         # 진입블록 시작 시간(예측 표시)
+        "entry": float(Entry_now),             # 진입 예측가 (앵커 매핑)
+        "side": side,
+        "SL": None,
+        "TP": None,
+        "exit_time": exit_time_pred,           # 청산블록 끝 시간(예측 표시)
+        "exit": float(exit_pred),              # 청산 예측 종가 (앵커 매핑)
+        "exit_max": float(exit_max_pred),      # 청산 예측 고가 (앵커 매핑)
+        "gross_ret_%": None,
+        "net_ret_%": None
+    })
+
+    # ===== 기존 그래프 유지 =====
+    fig, ax = plt.subplots(figsize=(9,3))
+    ax.plot(np.arange(len(hist_full)), hist_full, label="매칭 72h(보정%)")
+    ax.plot(np.arange(len(a_plot)), a_plot, label=f"현재 진행 (L={len(a_plot)})")
+    ax.axvline(L-1, ls="--", label="엔트리 기준(28h)")
+    ax.axhline(thr, ls="--"); ax.axhline(-thr, ls="--"); ax.axhline(0, ls=":")
+    ax.set_title("NOW: 28h 기준 · 진행 vs 매칭")
+    ax.legend(); ax.grid(True, alpha=0.3)
     st.pyplot(fig)
+
+    
+    a_plot = ((cur_pred_seg["close"] - base_cur) / base_cur * 100.0).to_numpy(dtype=float)
+
+# 2) 프리픽스(≤28h) 기준으로 후보별 유사도 다시 계산해서 상위 5개 뽑기
+    sims = []
+    for r in results:
+        b = np.array(r["pct"], dtype=float)[:L]  # 프리픽스 길이로 맞춰 비교
+        sim_prefix = 1.0 if (np.allclose(a, 0) and np.allclose(b, 0)) else float(cosine_similarity([a], [b])[0][0])
+        sims.append({
+            "sim_prefix": sim_prefix,
+            "next_start": r["next_start"],
+            "next_end":   r["next_end"],
+            "pct":        r["pct"],            # 72h(보정%) 전체
+        })
+
+    topK = 5
+    top_cands = sorted(sims, key=lambda x: x["sim_prefix"], reverse=True)[:min(topK, len(sims))]
+
+# 3) 미니 비교 그래프: 1행 N열(최대 5개)
+    if top_cands:
+        ncols = len(top_cands)
+        fig_row, axes = plt.subplots(1, ncols, figsize=(3.2*ncols, 2.6), sharey=True)
+        if ncols == 1:
+            axes = [axes]  # 단일 축도 리스트처럼 다루기
+
+        for ax, c in zip(axes, top_cands):
+            hist_i = np.array(c["pct"], dtype=float)  # 과거 후보의 72h 보정% 전체
+            ax.plot(np.arange(len(hist_i)), hist_i, label="과거 72h(보정%)")
+            ax.plot(np.arange(len(a_plot)), a_plot, label=f"현재 진행 (L={len(a_plot)})", linewidth=2)
+
+        # 프리픽스 경계(엔트리 기준 28h)는 그대로 L-1
+            ax.axvline(L-1, ls="--")
+            ax.axhline(0, ls=":", alpha=0.7)
+        # 필요하면 임계선 표시
+            ax.axhline(thr, ls="--", alpha=0.3)
+            ax.axhline(-thr, ls="--", alpha=0.3)
+
+        # 타이틀: 후보 시작시간 + 유사도
+            try:
+                ttl = f"{pd.to_datetime(c['next_start']).strftime('%Y-%m-%d %H:%M')}\nsim={c['sim_prefix']:.2f}"
+            except Exception:
+                ttl = f"sim={c['sim_prefix']:.2f}"
+            ax.set_title(ttl, fontsize=10)
+            ax.grid(True, alpha=0.3)
+
+    # 범례는 첫 축에만
+        axes[0].legend(fontsize=8)
+        fig_row.suptitle("상위 5개 과거 흐름 vs 현재 진행 (프리픽스 기준 정렬)", fontsize=12, y=1.02)
+        plt.tight_layout()
+        st.pyplot(fig_row)
+    else:
+        st.caption("상위 후보가 없습니다.")
 
 # ================= LIVE (실거래) =================
 elif sim_mode == "LIVE":
@@ -599,11 +719,7 @@ if 'df_log' in locals() and df_log is not None and not df_log.empty:
     metrics = calc_metrics(df_log, equity_curve)
 
     if sim_mode == "NOW":
-        col1, col2, col3, col5 = st.columns(4)
-        col1.metric("거래수", metrics["n_trades"])
-        col2.metric("Hit-rate", f"{metrics['hit_rate']:.1f}%")
-        col3.metric("Avg Win/Loss", f"{metrics['avg_win']:.2f}% / {metrics['avg_loss']:.2f}%")
-        col5.metric("MDD / MAR", f"{metrics['mdd']*100:.2f}% / {metrics['mar']:.2f}")
+       pass
     else:
         col1, col2, col3, col4, col5 = st.columns(5)
         col1.metric("거래수", metrics["n_trades"])
