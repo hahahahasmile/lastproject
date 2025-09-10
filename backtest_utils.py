@@ -2,6 +2,7 @@
 import numpy as np
 import pandas as pd
 
+#백테스트 결과를 나타내는 함수들 
 def build_equity_curve(trades_df: pd.DataFrame, start_equity: float):
     df = trades_df.copy().sort_values("pred_start").reset_index(drop=True)
     if df.empty:

@@ -2,6 +2,7 @@
 import numpy as np
 import pandas as pd
 
+#펀딩비 데이터와 기존 4시간 봉 데이터 합치는 함수, 합친 다음에 칼럼 추가하는 함수 z_score구하는 함수 전처리 함수
 GLOBAL_Z_COLS = ['close','atr','vol_pct','funding']   # OI 제거
 SAFE_FEATS    = ['log_ret','close_z','atr_z','vol_pct_z','funding_z']
 FEAT_COLS     = ['close_z','log_ret','atr_z','vol_pct_z','funding_z']

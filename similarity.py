@@ -2,6 +2,7 @@
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 
+#유사도 측정하는 함수들
 def _to_seq(vec, L, F):
     arr = np.array(vec, dtype=float).reshape(L, F)
     return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)

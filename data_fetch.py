@@ -3,6 +3,7 @@ import time
 import pandas as pd
 from datetime import timedelta
 
+#2020년 1월 1일부터 4시간봉으로 데이터 수집 및 펀딩비를 수집한 함수
 def fetch_futures_4h_klines(client, symbol="BTCUSDT", interval="4h",
                             start_time="2020-01-01", end_time=None):
     all_data, current_time = [], start_time

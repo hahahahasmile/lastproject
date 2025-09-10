@@ -1,14 +1,15 @@
-# blocks.py
 import pandas as pd
 
-ANCHOR_BASE_UTC = pd.Timestamp("2025-08-11 00:00")  # KST 09:00 == UTC 00:00
+# KST 09:00 == UTC 00:00
+#ref 는 비교구간, pred는 예측구간 enumerate는 8월 11을 기준으로 후보 블록들을 생성하는 거 
+ANCHOR_BASE_UTC = pd.Timestamp("2025-08-11 00:00")  
 
 def pick_blocks(now_ts, step_hours=72):
     step = pd.Timedelta(hours=step_hours)
     n = int((now_ts - ANCHOR_BASE_UTC) // step)
-    ref_start = ANCHOR_BASE_UTC + (n - 1) * step
+    ref_start = ANCHOR_BASE_UTC + (n - 1) * step 
     ref_end   = ANCHOR_BASE_UTC + n * step
-    pred_start = ref_end
+    pred_start = ref_end #
     pred_end   = pred_start + step
     return (ref_start, ref_end), (pred_start, pred_end)
 

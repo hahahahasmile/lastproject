@@ -2,6 +2,7 @@
 import numpy as np
 import pandas as pd
 
+#가격 보정 백테스트
 def adjust_pct_by_price_level(current_price, base_price, pct_seq, ratio_min=1.5):
     if base_price is None or current_price is None: 
         return np.array(pct_seq, dtype=float)

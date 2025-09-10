@@ -188,14 +188,6 @@ def _make_percent_table_from_block(df_block: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def _scan_segments_28_72(df_block_pred: pd.DataFrame, thr_abs_pct: float = 2.0):
-    """
-    과거 '예측 블록(다음 72h)' 내부에서 진입·청산 조합 스캔.
-    - 진입: 블록 시가만, 인덱스 {7,8,9,10,11,12,13,14}  (28~60h)
-    - 청산: 진입 블록 종가 + 다음 3블록 종가 => 최대 4개
-    반환:
-      scan_df: 모든 32개 조합 (entry_k, exit_k, delta_pct)
-      best:    절댓값이 가장 큰 조합 dict( entry_k, exit_k, delta_pct, side, ok )
-    """
     n = len(df_block_pred)
     opens  = df_block_pred['open'].to_numpy(dtype=float)
     closes = df_block_pred['close'].to_numpy(dtype=float)
@@ -303,15 +295,19 @@ if sim_mode == "NOW":
     best_end   = best_start + stepTD
     df_best_next = df_full[(df_full["timestamp"] >= best_start) & (df_full["timestamp"] < best_end)]
 
-    side, max_up, max_down = decide_from_future_path(hist_full, L_prefix=L, thr_pct=thr)
+    scan_df, best_scan = _scan_segments_28_72(df_best_next, thr_abs_pct=float(thr))
+    side = best_scan["side"] if best_scan.get("ok", False) else "HOLD"
     if best["sim"] < 0.75:
         side = "HOLD"
     st.session_state["decision_logs"].append({
-        "mode": sim_engine, "w_dtw": w_dtw, "ratio_min": ratio_min, "thr_pct": thr,
-        "L_prefix": L, "ref_start": ref_start, "ref_end": ref_end,
-        "pred_start": pred_start, "pred_end": pred_end,
-        "best_sim_prefix": float(best["sim"]), "max_up": max_up, "max_down": max_down,
-        "decision": side
+    "mode": sim_engine, "w_dtw": w_dtw, "ratio_min": ratio_min, "thr_pct": thr,
+    "L_prefix": L, "ref_start": ref_start, "ref_end": ref_end,
+    "pred_start": pred_start, "pred_end": pred_end,
+    "best_sim_prefix": float(best["sim"]),
+    "decision": side,
+    "entry_k": int(best_scan.get("entry_k", -1)),
+    "exit_k": int(best_scan.get("exit_k", -1)),
+    "delta_pct": float(best_scan.get("delta_pct", 0.0)),
     })
     st.write(f"엔트리 기준시점: **{t_entry}** · 신호: **{side}** · 유사도(프리픽스)={best['sim']:.2f}")
 
@@ -359,9 +355,6 @@ if sim_mode == "NOW":
         "r_low_%":   (cur_pred_seg['low']   / cur_pred_seg['open'].iloc[0] - 1.0) * 100.0,
     }).reset_index(drop=True)
     
-    # ===== 전 범위 스캔(과거 예측 블록) =====
-    scan_df, best_scan = _scan_segments_28_72(df_best_next, thr_abs_pct=2.0)
-
     if not best_scan.get("ok", False):
         st.info("최대 |Δ%| < 2.0% (이상 기준 미충족) → 거래 시작 조건 불만족")
         # 계속 진행해도 표시는 가능하도록 중단하지 않음
