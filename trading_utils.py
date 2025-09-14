@@ -67,17 +67,14 @@ def make_sl_tp(entry_price, side, method="ATR", atr=None,
     return float(sl), float(tp)
 
 def position_size(equity_usdt, risk_pct, entry_price, sl_price,
-                  contract_value=1.0, max_leverage=10.0, max_notional=100_000.0,
+                  contract_value=1.0, max_leverage=10.0, max_notional=1_000_000_000.0,
                   qty_step=0.001):
-    if entry_price is None or sl_price is None or entry_price <= 0:
+    # ★ cap/리스크예산/SL거리 전부 무시하고 "입력 레버리지" 기준으로만 사이징
+    if equity_usdt is None or equity_usdt <= 0 or contract_value <= 0:
         return 0.0
-    risk_amount = float(equity_usdt) * float(risk_pct)
-    loss_frac = abs(entry_price - sl_price) / entry_price
-    if loss_frac <= 0: 
-        return 0.0
-    notional_calc = risk_amount / loss_frac
-    notional_cap = min(notional_calc, equity_usdt * max_leverage, max_notional)
-    contracts = notional_cap / contract_value
+    size_notional = float(equity_usdt) * float(max_leverage)                 # = equity × 입력 레버리지
+    size_notional = min(size_notional, float(max_notional))                  # 안전상 상한만 매우 크게 남김
+    contracts = size_notional / float(contract_value)
     contracts = _round_down(contracts, qty_step)
     return float(max(0.0, contracts))
 
