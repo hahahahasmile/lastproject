@@ -369,10 +369,22 @@ if sim_mode == "NOW":
     max_up = float(np.max(fut)) if fut.size > 0 else 0.0
     min_dn = float(np.min(fut)) if fut.size > 0 else 0.0
 
-    anchor = float(cur_prefix["close"].iloc[0])
-    last = float(cur_prefix["close"].iloc[-1])
-    regime_down = (last / anchor - 1.0) * 100.0 < 0.0
-
+    ext_start = pred_start - pd.Timedelta(hours=48)
+    prefix_end = min(t_entry, pred_end)
+    ext_seg = df_full[
+        (df_full["timestamp"] >= ext_start) &
+        (df_full["timestamp"] <= prefix_end)
+    ].reset_index(drop=True)
+    used_ext = (len(ext_seg) >= 2)
+    seg = ext_seg if len(ext_seg) >= 2 else cur_prefix # pred_seg은 기존 프리픽스 0~28h  
+    
+    anchor = float(seg["close"].iloc[0])
+    last = float(seg["close"].iloc[-1])
+    ret_pct = (last / anchor - 1.0) * 100.0
+    thr_ext  = -1.0  # 확장 세그 사용할 때(좀 더 보수적)
+    thr_cur  =  0.0  # 기존 프리픽스만 쓸 때(기존 로직과 동일)
+    cutoff   = (thr_ext if used_ext else thr_cur)
+    regime_down = (ret_pct < cutoff)
     sim_gate = 0.75 + (0.05 if regime_down else 0.0)
     LO_THR_USE = LO_THR + (0.5 if regime_down else 0.0)
     HI_THR_USE = HI_THR + (0.5 if regime_down else 0.0)
@@ -772,11 +784,23 @@ else:
         max_up = float(np.max(fut))   # 양수
         min_dn = float(np.min(fut))   # 음수
 
-        # 레짐 힌트
-        anchor = float(pred_seg["close"].iloc[0])
-        last = float(pred_seg["close"].iloc[-1])
-        regime_down = (last / anchor - 1.0) * 100.0 < 0.0
+        ext_start = pred_b["start"] - pd.Timedelta(hours=48)
+        prefix_end = min(t_entry, pred_b["end"])
+        ext_seg = df_roll[
+            (df_roll["timestamp"] >= ext_start) &
+            (df_roll["timestamp"] <= prefix_end)
+        ].reset_index(drop=True)
+        used_ext = (len(ext_seg) >= 2)
+        seg = ext_seg if used_ext else pred_seg  # pred_seg은 기존 프리픽스 0~28h  
+       
+        anchor = float(seg["close"].iloc[0])
+        last   = float(seg["close"].iloc[-1])
+        ret_pct = (last / anchor - 1.0) * 100.0
 
+        thr_ext  = -1.0   # 확장 세그(ext_seg)일 때: 완만/긴 구간이라 -1% 같은 더 보수적 컷                  (네가 원한 값)
+        thr_pred =  0.0   # 기본 프리픽스(pred_seg)일 때: 0% 미만이면 하락 레짐                           (기존 값)  
+        cutoff   = (thr_ext if used_ext else thr_pred)
+        regime_down = (ret_pct < cutoff)
         sim_gate = 0.75 + (0.05 if regime_down else 0.0)
         LO_THR_USE = LO_THR + (0.5 if regime_down else 0.0)
         HI_THR_USE = HI_THR + (0.5 if regime_down else 0.0)

@@ -11,10 +11,10 @@ from binance.client import Client
 # =====================================================
 SYMBOL      = "BTCUSDT"
 SIDE        = "LONG"          # "LONG" 또는 "SHORT"
-ENTRY       = "2025-09-11 04:00:00"   # 진입 시점 (UTC로 해석)
-ENTRY_PRICE = 113729         # 터치-진입 가격 (None이면 첫 분봉 시가로 즉시 진입)
-TP_PRICE    = 116682         # 익절가 (필수)
-SL_PRICE    = 112745        # 손절가 (없으면 None)
+ENTRY       = "2025-09-20 04:00:00"   # 진입 시점 (UTC로 해석)
+ENTRY_PRICE = 115909       # 터치-진입 가격 (None이면 첫 분봉 시가로 즉시 진입)
+TP_PRICE    = 118011        # 익절가 (필수)
+SL_PRICE    = 115209        # 손절가 (없으면 None)
 LEVERAGE    = 10.0
 FEE_ENTRY   = 0.0004          # 0.04%
 FEE_EXIT    = 0.0005          # 0.05%
