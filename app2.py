@@ -8,16 +8,17 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-
+from pandas.api.types import is_datetime64_any_dtype, is_datetime64tz_dtype
 from connectors import (
     connect_binance, connect_binance_trade,
     get_futures_balances, get_futures_positions,
     ensure_leverage_and_margin, get_symbol_filters,
 )
 from data_fetch import fetch_futures_4h_klines, fetch_funding_rate
+import features as F
 from features import (
     add_features, apply_static_zscore, finalize_preprocessed,
-    window_is_finite, window_vector, GLOBAL_Z_COLS, FEAT_COLS,
+    window_is_finite, window_vector, GLOBAL_Z_COLS, align_external_to_klines
 )
 # Static-only
 from similarity import sim_tier3
@@ -28,6 +29,7 @@ from trading_utils import (
 )
 from backtest_utils import build_equity_curve, calc_metrics
 from sklearn.metrics.pairwise import cosine_similarity
+from news_fetch import build_news_frame
 
 # ---------------------------
 # 기본 UI 설정
@@ -111,8 +113,93 @@ df_raw = fetch_futures_4h_klines(client, start_time="2020-01-01")
 df_funding = fetch_funding_rate(client, start_time="2020-01-01")
 df_feat = add_features(df_raw, df_funding)
 
+df_news = build_news_frame(start_ts="2020-01-01", end_ts=None)
+
+def _attach_news_feature(df_feat_local: pd.DataFrame, df_news_local: pd.DataFrame, col: str) -> pd.DataFrame:
+    """
+    df_feat(베이스)와 df_news(외부) timestamp의 dtype을 맞춰서 merge_asof가 터지지 않게 한다.
+    - 베이스가 tz-aware면 ext도 tz-aware(UTC)로 맞추고, 둘 다 정렬한다.
+    - 베이스가 tz-naive면 ext도 tz-naive(UTC 기준 값에서 tz 제거)로 맞춘다.
+    - df_news에 해당 컬럼이 없거나 값이 비어도 0.0 stub으로 안전하게 붙인다.
+    """
+    if (df_news_local is None) or df_news_local.empty:
+        # df_news가 비어도 스텁 0.0 컬럼을 만들어 두되, align은 생략
+        if col not in df_feat_local.columns:
+            df_feat_local = df_feat_local.copy()
+            df_feat_local[col] = 0.0
+        return df_feat_local
+
+    # 외부 프레임 복사 및 필요한 컬럼만 준비
+    ext = df_news_local.copy()
+    if "timestamp" not in ext.columns:
+        # timestamp 없으면 전부 0 스텁
+        if col not in df_feat_local.columns:
+            df_feat_local = df_feat_local.copy()
+            df_feat_local[col] = 0.0
+        return df_feat_local
+
+    # 대상 컬럼이 없으면 0 스텁 만들어 병합해도 무방
+    if col not in ext.columns:
+        ext[col] = 0.0
+
+    # dtype 정리
+    if not is_datetime64_any_dtype(df_feat_local["timestamp"]):
+        df_feat_local["timestamp"] = pd.to_datetime(df_feat_local["timestamp"], errors="coerce")
+    if not is_datetime64_any_dtype(ext["timestamp"]):
+        ext["timestamp"] = pd.to_datetime(ext["timestamp"], errors="coerce")
+
+    base_is_tz = is_datetime64tz_dtype(df_feat_local["timestamp"].dtype)
+    ext_is_tz  = is_datetime64tz_dtype(ext["timestamp"].dtype)
+
+    if base_is_tz:
+        # 베이스가 tz-aware → ext도 tz-aware(UTC)
+        ext["timestamp"] = pd.to_datetime(ext["timestamp"], utc=True)
+        # 혹시 베이스에 tz-naive가 섞여 있으면 UTC로 강제 캐스팅
+        df_feat_local = df_feat_local.copy()
+        df_feat_local["timestamp"] = pd.to_datetime(df_feat_local["timestamp"], utc=True)
+    else:
+        # 베이스가 tz-naive → ext도 tz-naive(UTC 기준값에서 tz 제거)
+        ext["timestamp"] = pd.to_datetime(ext["timestamp"], utc=True).dt.tz_localize(None)
+        if is_datetime64tz_dtype(df_feat_local["timestamp"].dtype):
+            df_feat_local = df_feat_local.copy()
+            df_feat_local["timestamp"] = pd.to_datetime(df_feat_local["timestamp"], utc=True).dt.tz_localize(None)
+
+    # 정렬 필수
+    ext = ext.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    df_feat_local = df_feat_local.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+
+    # 시계열 안전 병합 (features.align_external_to_klines 사용)
+    return align_external_to_klines(df_feat_local, ext, col)
+
+# ② news_vol 파생: news_count + cpanic_cnt (둘 중 없으면 0으로)
+if (df_news is not None) and (not df_news.empty):
+    if "news_count" not in df_news.columns:
+        df_news["news_count"] = 0.0
+    if "cpanic_cnt" not in df_news.columns:
+        df_news["cpanic_cnt"] = 0.0
+    df_news["news_vol"] = df_news["news_count"].fillna(0.0) + df_news["cpanic_cnt"].fillna(0.0)
+
+# ③ 꼭 쓸 2개만 부착 (없어도 0으로 들어가게 설계)
+df_feat = _attach_news_feature(df_feat, df_news, "news_tone")
+df_feat = _attach_news_feature(df_feat, df_news, "news_vol")
+# (선택) Google Trends까지 쓰려면 아래 라인 활성화
+# df_feat = _attach_news_feature(df_feat, df_news, "trends_btc")
+
+# ④ 정규화·특징 컬럼 등록 (중복 방지)
+def _safe_add(lst, item):
+    if item not in lst:
+        lst.append(item)
+
+_safe_add(GLOBAL_Z_COLS, "news_tone")
+_safe_add(GLOBAL_Z_COLS, "news_vol")
+_safe_add(F.FEAT_COLS, "news_tone_z")
+_safe_add(F.FEAT_COLS, "news_vol_z")
+
+# ⑤ 정규화(훈련 구간 고정) 후 기존 파이프라인 합류
 train_end_ts_static = pd.Timestamp("2022-07-01 00:00:00")
 df_full_static = apply_static_zscore(df_feat.copy(), GLOBAL_Z_COLS, train_end_ts_static)
+
+
 df_full_static = finalize_preprocessed(df_full_static, window_size)
 now_ts = df_full_static["timestamp"].iloc[-1]
 (ref_start, ref_end), (pred_start, pred_end) = pick_blocks(now_ts, step_hours=step_hours)
@@ -124,22 +211,37 @@ if len(df_full_static) < window_size:
 # A-logic helpers
 # ---------------------------
 def _window_is_finite_a(df_window, cols):
-    arr = df_window[cols].to_numpy()
+    use_cols = [c for c in cols if c in df_window.columns]
+    if not use_cols:
+        return False
+    arr = df_window[use_cols].to_numpy()
     return np.isfinite(arr).all()
 
 def _window_vector_a(df_window, feat_cols, L=18):
-    X = df_window[feat_cols].to_numpy(dtype=float)
+    use_cols = [c for c in feat_cols if c in df_window.columns]
+    if not use_cols:
+        return np.array([], dtype=float)
+
+    X = df_window[use_cols].to_numpy(dtype=float)
+
     MINMAX_COLS = ['log_ret','atr_z','vol_pct_z']
     for c in MINMAX_COLS:
-        if c in feat_cols:
-            j = feat_cols.index(c); v = X[:, j]
+        if c in use_cols:
+            j = use_cols.index(c)
+            v = X[:, j]
             vmin, vmax = np.nanmin(v), np.nanmax(v)
             X[:, j] = 0.0 if vmax <= vmin else (v - vmin) / (vmax - vmin)
+
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
     return X.reshape(-1)
 
 def get_candidates_a(df_pool, ref_range, df_ref, feat_cols, step_hours=72, window_size=18,
                      sim_mode='DTW', w_dtw=0.5, topN=10, ex_margin_days=5):
+    # ❗ df_pool/df_ref 모두에 존재하는 피처만 사용
+    feat_cols = [c for c in feat_cols if (c in df_pool.columns and c in df_ref.columns)]
+    if not feat_cols:
+        return []
+
     ref_seg = df_ref[(df_ref["timestamp"] >= ref_range[0]) & (df_ref["timestamp"] < ref_range[1])]
     if len(ref_seg) < window_size: return []
     wL = ref_seg.iloc[:window_size]
@@ -148,16 +250,23 @@ def get_candidates_a(df_pool, ref_range, df_ref, feat_cols, step_hours=72, windo
 
     blocks = enumerate_blocks(df_pool, step_hours=step_hours, window_size=window_size)
     ex_margin = pd.Timedelta(days=ex_margin_days)
-    F = len(feat_cols); cand = []
+    F = len(feat_cols)
+    cand = []
     for b in blocks:
-        if not (b["end"] <= ref_range[0] - ex_margin or b["start"] >= ref_range[1] + ex_margin): continue
+        if not (b["end"] <= ref_range[0] - ex_margin or b["start"] >= ref_range[1] + ex_margin):
+            continue
         w = df_pool[(df_pool["timestamp"] >= b["start"]) & (df_pool["timestamp"] < b["end"])]
-        if len(w) < window_size: continue
+        if len(w) < window_size:
+            continue
         wL2 = w.iloc[:window_size]
-        if not _window_is_finite_a(wL2, feat_cols): continue
+        if not _window_is_finite_a(wL2, feat_cols):
+            continue
         vec_hist = _window_vector_a(wL2, feat_cols, L=window_size)
+        if vec_hist.size == 0 or vec_ref.size == 0:
+            continue
         sim = sim_tier3(vec_ref, vec_hist, L=window_size, F=F, mode=sim_mode, w_dtw=w_dtw)
         cand.append({"start": b["start"], "end": b["end"], "sim": sim})
+
     cand.sort(key=lambda x: x["sim"], reverse=True)
     return cand[:topN]
 
@@ -168,9 +277,16 @@ def get_candidates(df, ref_range, ex_margin_days=5, topN=10, past_only=False):
     wL = ref_seg.iloc[:window_size]
     if not window_is_finite(wL): return []
     vec_ref = window_vector(wL, L=window_size)
+
+    # --- 방어적 F 계산: vec_ref 길이로부터 실제 feature 개수 F 역산 ---
+    if len(vec_ref) % window_size != 0:
+        # 벡터 길이가 L의 배수가 아니면 스킵(스키마 불일치)
+        return []
+    F = len(vec_ref) // window_size
+
     blocks = enumerate_blocks(df, step_hours=step_hours, window_size=window_size)
     ex_margin = pd.Timedelta(days=ex_margin_days)
-    F = len(FEAT_COLS); cand = []
+    cand = []
     for b in blocks:
         if past_only:
             if not (b["end"] <= ref_range[0] - ex_margin): continue
@@ -181,6 +297,11 @@ def get_candidates(df, ref_range, ex_margin_days=5, topN=10, past_only=False):
         wL2 = w.iloc[:window_size]
         if not window_is_finite(wL2): continue
         vec_hist = window_vector(wL2, L=window_size)
+
+        # 후보 벡터가 (L * F) 길이와 일치하지 않으면 스킵
+        if len(vec_hist) != window_size * F:
+            continue
+
         sim = sim_tier3(vec_ref, vec_hist, L=window_size, F=F, mode=sim_engine, w_dtw=w_dtw)
         cand.append({"start": b["start"], "end": b["end"], "sim": sim})
     cand.sort(key=lambda x: x["sim"], reverse=True)
@@ -223,11 +344,16 @@ if sim_mode == "NOW-상승":
     df_full = df_full_static  # NOW는 static 기준 사용
 
     # 후보 탐색
-    cands = get_candidates(
-        df_full, (ref_start, ref_end),
-        ex_margin_days=10 if fast else 5,
-        topN=5 if fast else 10,
-        past_only=True
+    cands = get_candidates_a(
+    df_pool=df_full,
+    ref_range=(ref_start, ref_end),
+    df_ref=df_full,
+    feat_cols=F.FEAT_COLS,   # features 모듈에서 in-place로 확장한 FEAT_COLS 사용
+    step_hours=step_hours,
+    window_size=window_size,
+    sim_mode="DTW", w_dtw=0.5,
+    topN=5 if fast else 10,
+    ex_margin_days=10 if fast else 5
     )
 
     results = []
@@ -239,7 +365,7 @@ if sim_mode == "NOW-상승":
         if len(df_next) < window_size:
             continue
         closes = df_next["close"].to_numpy()
-        base = float(df_next["close"].iloc[0])  # 0h open (분모로 사용할 값)
+        base = float(df_next["open"].iloc[0])  # 0h open (분모로 사용할 값)
         pct_raw = (closes - base) / base * 100.0
         # 28h 종가(없으면 마지막 종가) — 기록은 하되 분모로 쓰지 않음
         ENTRY_DELAY_BARS = max(1, int(np.ceil(ENTRY_DELAY_HOURS / 4)))  # 28h -> 7 bars
@@ -389,7 +515,7 @@ if sim_mode == "NOW-상승":
     st.markdown(f"### 📌 현재 판정: **{current_scenario} 시나리오**")
     st.caption(f"현재 유사도 = {best['sim']:.3f} / 게이트 = {sim_gate_base:.2f}")
     st.write(f"🕒 현재 데이터 최신 시점: {now_ts}")
-    
+
     STRAT_DESC = {
         "A": "강한 상승: HI_THR_USE 이상 & (상승우위) & 비하락레짐 → 다음봉 시가 (LONG)",
         "B": "강한 하락: HI_THR_USE 이상 & (하락우위 또는 하락레짐+상승우위) → 다음봉 시가 (SHORT)",
@@ -434,7 +560,7 @@ if sim_mode == "NOW-상승":
         ENTRY_FIX_TS, ENTRY_FIX_PRICE = (None, None)
     else:
         ENTRY_FIX_TS  = _seg_after["timestamp"].iloc[0]          # 28h '직후' 첫 오픈
-        ENTRY_FIX_PRICE = float(_seg_after["open"].iloc[0])  
+        ENTRY_FIX_PRICE = float(_seg_after["open"].iloc[0])
 
     # 28h 시점의 "현재 기준 가격"(되돌림 타깃 산출용)
     CUR_28H_CLOSE = _get_close_at_or_before(df_full, ENTRY_ANCHOR_TS)
@@ -1018,11 +1144,11 @@ elif sim_mode == "BT-상승":
                         eprice = float(seg_after["open"].iloc[0])
                 entry_time, entry_price = etime, eprice
             else:
-                
+
                 df_next_best = best["flow"]["df_next"]
                 base_hist_close = float(best["flow"]["base_close"])
                 cur_28h_close = _get_close_at_or_before(df_roll, t_entry)
-                
+
                 if cur_28h_close is not None:
                     if side == "LONG":
                         end_k = min((L - 1) + idx_max, len(df_next_best) - 1)
@@ -1162,15 +1288,16 @@ elif sim_mode == "BT-상승":
 # NOW (B)
 # ---------------------------
 elif sim_mode == "NOW-하락/횡보":
-    st.subheader("NOW-하락/횡보: 28h 지연 엔트리 · 1회 거래 (2020 풀 기반, 고정 엔트리 규칙, 앵커=28h 종가 정렬)")
 
-    # ── 스케일/풀 정의 (2020) ─────────────────────────────────────
-    SCALE_END_B   = pd.Timestamp("2020-11-01 00:00:00")
+    # ✅ 뉴스/정규화 파이프라인을 NOW-상승과 완전히 동일하게 사용
+    #    df_full_static에는 이미 build_news_frame() 결과가 병합되고 z-score/결측 보정이 끝난 상태입니다.
+    #    하락/횡보 모드에서도 동일 파이프라인을 재사용합니다.
     POOL_START_B  = pd.Timestamp("2020-01-01 00:00:00")
     POOL_END_B    = pd.Timestamp("2020-11-01 00:00:00")
 
-    df_full_b = apply_static_zscore(df_feat.copy(), GLOBAL_Z_COLS, SCALE_END_B)
-    df_full_b = finalize_preprocessed(df_full_b, window_size)
+    # NOW-상승과 동일한 df_full_static(뉴스 병합+정규화 완료본) 재사용
+    df_full_b = df_full_static.copy()
+
 
     pool_df_b = df_full_b[(df_full_b["timestamp"] >= POOL_START_B) & (df_full_b["timestamp"] < POOL_END_B)].reset_index(drop=True)
     if len(pool_df_b) < window_size:
@@ -1183,7 +1310,7 @@ elif sim_mode == "NOW-하락/횡보":
         df_pool=pool_df_b,
         ref_range=(ref_start, ref_end),
         df_ref=df_full_b,
-        feat_cols=FEAT_COLS,
+        feat_cols=F.FEAT_COLS,
         step_hours=step_hours,
         window_size=window_size,
         sim_mode="DTW", w_dtw=0.5,
@@ -1586,7 +1713,7 @@ elif sim_mode == "BT-하락/횡보":
             df_pool=pool_df_b,
             ref_range=(ref_b["start"], ref_b["end"]),
             df_ref=df_full_b,
-            feat_cols=FEAT_COLS,
+            feat_cols=F.FEAT_COLS,
             step_hours=step_hours, window_size=window_size,
             sim_mode=sim_engine, w_dtw=0.5,  # Hybrid 없음 → w_dtw 무시
             topN=topN, ex_margin_days=ex_margin_days

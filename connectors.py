@@ -26,20 +26,52 @@ def get_futures_balances(client):
         "available_balance": float(usdt.get("withdrawAvailable", usdt["balance"])) if usdt else 0.0,
     }
 
-def get_futures_positions(client, symbol="BTCUSDT"):
-    infos = client.futures_position_information(symbol=symbol)
+def get_futures_positions(client, symbol: str | None = None):
+    """
+    - symbol 지정 시 해당 심볼만, 미지정 시 전체
+    - 수량 0 포지션 제외
+    - marginType이 없으면 isolated(True/False)로 유추
+    - 키/타입을 안전하게 변환
+    """
+    infos = (client.futures_position_information(symbol=symbol)
+             if symbol else client.futures_position_information())
+
     out = []
     for p in infos:
-        amt = float(p["positionAmt"])
+        try:
+            amt = float(p.get("positionAmt", 0) or 0)
+        except Exception:
+            amt = 0.0
         if abs(amt) < 1e-12:
             continue
+
+        # leverage
+        lev_raw = p.get("leverage")
+        try:
+            lev = int(float(lev_raw)) if lev_raw not in (None, "", "0") else None
+        except Exception:
+            lev = None
+
+        # margin type: marginType 없으면 isolated로 유추
+        mtype = p.get("marginType")
+        if not mtype:
+            iso = p.get("isolated")
+            if iso is True:
+                mtype = "ISOLATED"
+            elif iso is False:
+                mtype = "CROSS"
+            else:
+                mtype = None
+
         out.append({
-            "symbol": p["symbol"],
+            "symbol": p.get("symbol"),
             "positionAmt": amt,
-            "entryPrice": float(p["entryPrice"]),
-            "unRealizedPnL": float(p["unRealizedProfit"]),
-            "leverage": int(p["leverage"]),
-            "marginType": p["marginType"],
+            "entryPrice": float(p.get("entryPrice", 0) or 0),
+            "unRealizedProfit": float(p.get("unRealizedProfit", 0) or 0),
+            "leverage": lev,                 # ← 보강
+            "marginType": mtype,             # ← 보강
+            "markPrice": float(p.get("markPrice", 0) or 0),
+            "liquidationPrice": float(p.get("liquidationPrice", 0) or 0),
         })
     return out
 
@@ -65,18 +97,3 @@ def get_symbol_filters(client, symbol="BTCUSDT"):
             step_size = float(f["stepSize"])
     return tick_size, step_size
 
-def get_spot_balances(client):
-    bals = client.get_account()
-    assets = []
-    for b in bals["balances"]:
-        free = float(b["free"])
-        locked = float(b["locked"])
-        total = free + locked
-        if total > 0:
-            assets.append({
-                "asset": b["asset"],
-                "free": free,
-                "locked": locked,
-                "total": total
-            })
-    return assets
