@@ -1,1 +1,33 @@
+# Python 캐시/바이너리
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.dylib
+*.dll
+*.egg-info/
+*.dist-info/
+*.spec
+*.cpython-*
+
+# 가상환경
+.venv/
+venv/
+env/
+
+# IDE/OS
+.vscode/
+.DS_Store
+
+# 민감/임시
 .env
+secrets.toml
+.streamlit/
+*.log
+
+# 대용량 원본(필요 시)
+data/
+datasets/
+models/
+checkpoints/
