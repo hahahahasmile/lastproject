@@ -1,11 +1,18 @@
+# app.py (전체)  -- 수정본 (튜너용 evaluate_wrapper + run_backtest_with_params 포함)
+
 # === Prelude: 한글 폰트/음수 디폴트 적용 (UI 없음) ===
 import matplotlib.pyplot as plt
 plt.rcParams['font.family'] = 'Malgun Gothic'   # Windows 한글 폰트
 plt.rcParams['axes.unicode_minus'] = False      # 음수 기호 깨짐 방지
-
+import inspect
 import streamlit as st
 import numpy as np
 import pandas as pd
+import json
+import time
+from collections import deque
+
+# === 프로젝트 모듈 ===
 from connectors import (
     connect_binance, connect_binance_trade,
     get_futures_balances, get_futures_positions,
@@ -25,6 +32,9 @@ from trading_utils import (
 from backtest_utils import build_equity_curve, calc_metrics
 from sklearn.metrics.pairwise import cosine_similarity
 
+# === 베이즈 튜너(메타 모델) ===
+from tuner import run_bayes_opt
+
 # ---------------------------
 # 기본 UI 설정
 # ---------------------------
@@ -32,7 +42,7 @@ st.set_page_config(page_title="BTC 패턴매칭 전략 스튜디오", page_icon=
 st.title("📈 BTC 패턴매칭 전략 스튜디오")
 
 # ---------------------------
-# 공통 하이퍼파라미터
+# 공통 하이퍼파라미터 (기본값)
 # ---------------------------
 step_hours = 72
 window_size = 18
@@ -49,8 +59,9 @@ STRAT_SLTPS = {
     "C′": {"method": "ATR", "k_sl": 1.5, "k_tp": 1.5, "sl_pct": None, "tp_pct": None},
     "E":  {"method": "ATR", "k_sl": None, "k_tp": None, "sl_pct": None, "tp_pct": None},  # HOLD
 }
+
 # ---------------------------
-# 상단 UI
+# 상단: 모드 선택 + 공통 파라미터
 # ---------------------------
 colA, colB, colC = st.columns(3)
 
@@ -79,6 +90,33 @@ with colA:
     equity = 1000.0
     max_leverage = 10.0
 
+# ---------------------------
+# 🔌 튜닝값 사용 토글 + 전역 주입
+# ---------------------------
+use_tuned = st.toggle(
+    "🧠 튜닝값 사용(BO/Surrogate)", value=False,
+    help="튜닝 섹션에서 저장한 best params를 NOW/BT-상승/LIVE에 주입"
+)
+tuned = st.session_state.get("tuned_params")
+
+if use_tuned and tuned:
+    # 게이트/지연
+    sim_gate_base     = float(tuned.get("sim_gate", sim_gate_base))
+    ENTRY_DELAY_HOURS = float(tuned.get("delay_h",  ENTRY_DELAY_HOURS))
+    # 태그별 k 설정 (NOW/BT-상승/LIVE에서 _resolve_sltp_by_tag가 참조)
+    STRAT_SLTPS["A"]["k_sl"] = STRAT_SLTPS["B"]["k_sl"] = float(tuned.get("k_sl_A", STRAT_SLTPS["A"]["k_sl"]))
+    STRAT_SLTPS["A"]["k_tp"] = STRAT_SLTPS["B"]["k_tp"] = float(tuned.get("k_tp_A", STRAT_SLTPS["A"]["k_tp"]))
+    STRAT_SLTPS["C"]["k_sl"] = STRAT_SLTPS["C′"]["k_sl"] = float(tuned.get("k_sl_C", STRAT_SLTPS["C"]["k_sl"]))
+    STRAT_SLTPS["C"]["k_tp"] = STRAT_SLTPS["C′"]["k_tp"] = float(tuned.get("k_tp_C", STRAT_SLTPS["C"]["k_tp"]))
+    st.caption(
+        f"튜닝 적용 → sim_gate={sim_gate_base:.3f}, delay_h={ENTRY_DELAY_HOURS:.0f}, "
+        f"A/B k_sl={STRAT_SLTPS['A']['k_sl']:.2f}, k_tp={STRAT_SLTPS['A']['k_tp']:.2f}, "
+        f"C/C′ k_sl={STRAT_SLTPS['C']['k_sl']:.2f}, k_tp={STRAT_SLTPS['C']['k_tp']:.2f}"
+    )
+
+# ---------------------------
+# BT-상승 모드에서만 노출되는 세부 입력
+# ---------------------------
 if sim_mode == "BT-상승":
     with colA:
         sim_engine = st.selectbox(
@@ -87,15 +125,25 @@ if sim_mode == "BT-상승":
             index=0,
             help="과거 구간과의 유사도 계산 메트릭. DTW(동적 타임워핑) 또는 Cosine(코사인 유사도)만 허용."
         )
-        A_sl = st.number_input("A/B SL(%)", 0.1, 50.0, 1.0, 0.1) 
-        A_tp = st.number_input("A/B TP(%)", 0.1, 50.0, 2.5, 0.1) 
-        C_sl = st.number_input("C/C′ SL(%)", 0.1, 50.0, 1.5, 0.1) 
-        C_tp = st.number_input("C/C′ TP(%)", 0.1, 50.0, 1.5, 0.1) 
+        if use_tuned and tuned:
+            st.text_input("A/B SL(×ATR)", value=f"{STRAT_SLTPS['A']['k_sl']:.2f}", disabled=True)
+            st.text_input("A/B TP(×ATR)", value=f"{STRAT_SLTPS['A']['k_tp']:.2f}", disabled=True)
+            st.text_input("C/C′ SL(×ATR)", value=f"{STRAT_SLTPS['C']['k_sl']:.2f}", disabled=True)
+            st.text_input("C/C′ TP(×ATR)", value=f"{STRAT_SLTPS['C']['k_tp']:.2f}", disabled=True)
+            A_sl = STRAT_SLTPS['A']['k_sl']; A_tp = STRAT_SLTPS['A']['k_tp']
+            C_sl = STRAT_SLTPS['C']['k_sl']; C_tp = STRAT_SLTPS['C']['k_tp']
+        else:
+            A_sl = st.number_input("A/B SL(×ATR)", 0.1, 50.0, 1.0, 0.1)
+            A_tp = st.number_input("A/B TP(×ATR)", 0.1, 50.0, 2.5, 0.1)
+            C_sl = st.number_input("C/C′ SL(×ATR)", 0.1, 50.0, 1.5, 0.1)
+            C_tp = st.number_input("C/C′ TP(×ATR)", 0.1, 50.0, 1.5, 0.1)
+
     with colB:
         fee_entry  = st.number_input("진입 수수료(%)", 0.0, 1.0, 0.04, 0.01, help="백테스트 체결을 현실화하기 위한 가정 수수료. 0.04는 0.04%.") / 100.0
         fee_exit   = st.number_input("청산 수수료(%)", 0.0, 1.0, 0.05, 0.01, help="백테스트 체결 현실화용 가정 수수료.") / 100.0
         slip_entry = st.number_input("진입 슬리피지(%)", 0.0, 0.5, 0.03, 0.01, help="체결 미끄러짐 가정치(%).") / 100.0
         slip_exit  = st.number_input("청산 슬리피지(%)", 0.0, 0.5, 0.05, 0.01, help="체결 미끄러짐 가정치(%).") / 100.0
+
     with colC:
         equity = st.number_input("가상 Equity (USDT)", 10.0, value=1000.0, step=10.0, help="백테스트/포지션 사이징에 사용하는 가상의 계정 잔고(USDT).")
         max_leverage = st.number_input("최대 레버리지(x)", 1.0, 50.0, 10.0, 1.0, help="사이징 계산 시 사용할 레버리지 상한(실체결 한도 아님).")
@@ -118,8 +166,9 @@ now_ts = df_full_static["timestamp"].iloc[-1]
 if len(df_full_static) < window_size:
     st.error("데이터가 부족합니다."); st.stop()
 
-
-# 공통으로 사용되는 함수
+# ---------------------------
+# 공통 유틸 함수들
+# ---------------------------
 def get_candidates(df, ref_range, ex_margin_days=5, topN=10, past_only=False):
     ref_seg = df[(df["timestamp"] >= ref_range[0]) & (df["timestamp"] < ref_range[1])]
     if len(ref_seg) < window_size: return []
@@ -171,10 +220,13 @@ def _touch_entry(df: pd.DataFrame, start_ts, end_ts, side: str, target_price: fl
     else:
         hit = seg[seg["high"] >= target_price]
         return (hit["timestamp"].iloc[0], float(target_price)) if not hit.empty else (None, None)
-    
-def _resolve_sltp_by_tag(tag: str, default_method: str, default_k_sl: float, default_k_tp: float):
+
+def _resolve_sltp_by_tag(tag: str, default_method: str, default_k_sl: float, default_k_tp: float, strat_sltps_override: dict = None):
     """전략 태그(A/B/C/C′/E)에 맞는 SL/TP 파라미터를 리턴."""
-    cfg = STRAT_SLTPS.get(tag, {})
+    if strat_sltps_override is None:
+        cfg = STRAT_SLTPS.get(tag, {})
+    else:
+        cfg = strat_sltps_override.get(tag, STRAT_SLTPS.get(tag, {}))
     method = cfg.get("method", default_method)
     # 퍼센트 방식이면 k_*는 무시
     if method.upper() == "PCT":
@@ -1178,3 +1230,407 @@ elif sim_mode == "LIVE":
             st.dataframe(df_pos[show], use_container_width=True)
     except Exception as e:
         st.warning(f"포지션 조회 실패: {e}")
+        
+def run_backtest_with_params(
+    df_full_static_local: pd.DataFrame,
+    params: dict,
+    ROLL_START: pd.Timestamp,
+    equity_start: float = 1000.0,
+    max_leverage_local: float = 10.0,
+    fee_entry_local: float = 0.0004,
+    fee_exit_local: float = 0.0005,
+    slip_entry_local: float = 0.0003,
+    slip_exit_local: float = 0.0005,
+    step_hours_local: int = 72,
+    window_size_local: int = 18,
+    topN_local: int = 5,
+    exd_local: int = 10,
+    hist_start_static_local: pd.Timestamp = pd.Timestamp("2025-01-01 00:00:00"),
+    sim_engine_local: str = "DTW",
+    A_sl_local: float = None,
+    A_tp_local: float = None,
+    C_sl_local: float = None,
+    C_tp_local: float = None,
+    sim_gate_base_local: float = None,
+    ENTRY_DELAY_HOURS_local: int = None,
+):
+    """
+    params: dict from tuner.sample_params (k_sl_A, k_tp_A, k_sl_C, k_tp_C, sim_gate, delay_h)
+    returns: df_log (DataFrame) with trade rows (same schema as app's BT-상승)
+    """
+    # Make a local copy to avoid side-effects
+    df_roll = df_full_static_local[df_full_static_local["timestamp"] >= (ROLL_START - pd.Timedelta(hours=72))].reset_index(drop=True)
+    if len(df_roll) < window_size_local:
+        return pd.DataFrame([])
+
+    blocks_all = enumerate_blocks(df_roll, step_hours=step_hours_local, window_size=window_size_local)
+    # find start index
+    start_idx = None
+    for i in range(1, len(blocks_all)):
+        if blocks_all[i]["start"] >= ROLL_START:
+            start_idx = i
+            break
+    if start_idx is None:
+        return pd.DataFrame([])
+
+    # override strat sltps by params (per-request copy)
+    strat_local = {
+        "A":  {"method": "ATR", "k_sl": float(params.get("k_sl_A", A_sl_local or STRAT_SLTPS["A"]["k_sl"])), "k_tp": float(params.get("k_tp_A", A_tp_local or STRAT_SLTPS["A"]["k_tp"]))},
+        "B":  {"method": "ATR", "k_sl": float(params.get("k_sl_A", A_sl_local or STRAT_SLTPS["A"]["k_sl"])), "k_tp": float(params.get("k_tp_A", A_tp_local or STRAT_SLTPS["A"]["k_tp"]))},
+        "C":  {"method": "ATR", "k_sl": float(params.get("k_sl_C", C_sl_local or STRAT_SLTPS["C"]["k_sl"])), "k_tp": float(params.get("k_tp_C", C_tp_local or STRAT_SLTPS["C"]["k_tp"]))},
+        "C′": {"method": "ATR", "k_sl": float(params.get("k_sl_C", C_sl_local or STRAT_SLTPS["C"]["k_sl"])), "k_tp": float(params.get("k_tp_C", C_tp_local or STRAT_SLTPS["C"]["k_tp"]))},
+        "E":  {"method": "ATR", "k_sl": None, "k_tp": None},
+    }
+
+    sim_gate_local = float(params.get("sim_gate", sim_gate_base_local or sim_gate_base))
+    ENTRY_DELAY_HOURS_eff = int(params.get("delay_h", ENTRY_DELAY_HOURS_local or ENTRY_DELAY_HOURS))
+
+    trade_logs = []
+    eq_run = float(equity_start)
+
+    total = (len(blocks_all) - start_idx)
+    # iterate through rolling preds
+    for bp_index in range(start_idx, len(blocks_all)):
+        ref_b = blocks_all[bp_index - 1]
+        pred_b = blocks_all[bp_index]
+
+        # build hist df (from hist_start_static_local)
+        df_hist = df_full_static_local[df_full_static_local["timestamp"] >= hist_start_static_local].reset_index(drop=True)
+        cands = get_candidates(df_hist, (ref_b["start"], ref_b["end"]), ex_margin_days=exd_local, topN=topN_local, past_only=True)
+        if not cands:
+            continue
+
+        results = []
+        for f in cands:
+            next_start = f["end"]; next_end = next_start + pd.Timedelta(hours=step_hours_local)
+            df_next = df_hist[(df_hist["timestamp"] >= next_start) & (df_hist["timestamp"] < next_end)]
+            if len(df_next) < window_size_local:
+                continue
+            closes = df_next["close"].to_numpy()
+            baseC = float(closes[0])
+            pct_c = (closes - baseC) / baseC * 100.0
+            results.append({"sim": f["sim"], "next_start": next_start, "next_end": next_end, "pct": pct_c, "df_next": df_next.reset_index(drop=True), "base_close": baseC})
+        if not results:
+            continue
+
+        # compute t_entry
+        t_entry = pred_b["start"] + pd.Timedelta(hours=ENTRY_DELAY_HOURS_eff)
+        if t_entry > pred_b["end"]:
+            continue
+
+        # pred segment up to t_entry
+        pred_seg = df_roll[(df_roll["timestamp"] >= pred_b["start"]) & (df_roll["timestamp"] <= t_entry)]
+        if len(pred_seg) == 0:
+            continue
+        base_cur = float(pred_seg["close"].iloc[0])
+        a = ((pred_seg["close"] - base_cur) / base_cur * 100.0).to_numpy(dtype=float)
+        L = len(a)
+
+        # find best historical flow by cosine
+        best = None
+        for r in results:
+            b = np.array(r["pct"], dtype=float)[:L]
+            sim_shape = 1.0 if (np.allclose(a, 0) and np.allclose(b, 0)) else float(cosine_similarity([a], [b])[0][0])
+            if (best is None) or (sim_shape > best["sim"]):
+                best = {"sim": sim_shape, "flow": r}
+        if best is None:
+            continue
+
+        hist_full = np.array(best["flow"]["pct"], dtype=float)
+        base_now = float(hist_full[L - 1]) if len(hist_full) > 0 else 0.0
+        fut = hist_full[L - 1:] - base_now if len(hist_full) > L-1 else np.array([])
+        idx_max = int(np.argmax(fut)) if fut.size > 0 else 0
+        idx_min = int(np.argmin(fut)) if fut.size > 0 else 0
+        max_up = float(np.max(fut)) if fut.size > 0 else 0.0
+        min_dn = float(np.min(fut)) if fut.size > 0 else 0.0
+
+        # regime & side decision
+        ext_start = pred_b["start"] - pd.Timedelta(hours=48)
+        prefix_end = min(t_entry, pred_b["end"])
+        ext_seg = df_roll[(df_roll["timestamp"] >= ext_start) & (df_roll["timestamp"] <= prefix_end)].reset_index(drop=True)
+        used_ext = (len(ext_seg) >= 2)
+        seg = ext_seg if used_ext else pred_seg
+        anchor = float(seg["close"].iloc[0]); last = float(seg["close"].iloc[-1])
+        ret_pct = (last / anchor - 1.0) * 100.0
+        cutoff = -1.0 if used_ext else 0.0
+        regime_down = (ret_pct < cutoff)
+
+        # determine preliminary side using sim_gate_local and thresholds
+        side = "HOLD"
+        if best["sim"] >= sim_gate_local:
+            mag_up = abs(max_up); mag_dn = abs(min_dn); mag = max(mag_up, mag_dn)
+            if mag >= LO_THR:
+                if regime_down and (mag_up >= mag_dn):
+                    side = "SHORT"
+                else:
+                    side = "LONG" if mag_up >= mag_dn else "SHORT"
+
+        entry_time, entry_price, entry_target = (None, None, None)
+
+        if side in ("LONG", "SHORT"):
+            if max(abs(max_up), abs(min_dn)) >= HI_THR:
+                etime, eprice = make_entry_at(df_roll, t_entry, rule=ENTRY_RULE_FIXED)
+                if etime is not None and etime < t_entry:
+                    seg_after = df_roll[df_roll["timestamp"] > t_entry]
+                    if not seg_after.empty:
+                        etime = seg_after["timestamp"].iloc[0]
+                        eprice = float(seg_after["open"].iloc[0])
+                entry_time, entry_price = etime, eprice
+            else:
+                df_next_best = best["flow"]["df_next"]
+                base_hist_close = float(best["flow"]["base_close"])
+                cur_28h_close = _get_close_at_or_before(df_roll, t_entry)
+
+                if cur_28h_close is not None:
+                    if side == "LONG":
+                        end_k = min((L - 1) + idx_max, len(df_next_best) - 1)
+                        lows_slice = df_next_best["low"].iloc[:end_k + 1].to_numpy(dtype=float)
+                        if lows_slice.size > 0:
+                            low_min = float(np.min(lows_slice))
+                            drop_pct = (low_min / base_hist_close - 1.0) * 100.0
+                            mag_adj = _adjust_magnitude(abs(drop_pct))
+                            entry_target = cur_28h_close * (1.0 + (-mag_adj) / 100.0)
+                            entry_time, entry_price = _touch_entry(df_roll, t_entry, pred_b["end"], "LONG", entry_target)
+                    else:
+                        end_k = min((L - 1) + idx_min, len(df_next_best) - 1)
+                        highs_slice = df_next_best["high"].iloc[:end_k + 1].to_numpy(dtype=float)
+                        if highs_slice.size > 0:
+                            high_max = float(np.max(highs_slice))
+                            up_pct = (high_max / base_hist_close - 1.0) * 100.0
+                            mag_adj = _adjust_magnitude(abs(up_pct))
+                            entry_target = cur_28h_close * (1.0 + mag_adj / 100.0)
+                            entry_time, entry_price = _touch_entry(df_roll, t_entry, pred_b["end"], "SHORT", entry_target)
+
+        atr_ref = None
+        if entry_time is not None:
+            row_at = df_roll[df_roll["timestamp"] == entry_time]
+            if not row_at.empty and row_at["atr"].notna().any():
+                atr_ref = float(row_at["atr"].fillna(method='ffill').iloc[0])
+
+        sl, tp = (None, None)
+        if side in ("LONG", "SHORT") and entry_time is not None and entry_price is not None:
+            # tag based on same rule
+            mag = max(abs(max_up), abs(min_dn))
+            up_win = (abs(max_up) >= abs(min_dn))
+            dn_win = (abs(min_dn) >  abs(max_up))
+
+            if best["sim"] < sim_gate_local:
+                tag_bt = "E"
+            elif mag >= HI_THR:
+                if dn_win or (up_win and regime_down):
+                    tag_bt = "B"
+                elif up_win and (not regime_down):
+                    tag_bt = "A"
+                else:
+                    tag_bt = "E"
+            elif LO_THR <= mag < HI_THR:
+                if dn_win or (up_win and regime_down):
+                    tag_bt = "C′"
+                elif up_win and (not regime_down):
+                    tag_bt = "C"
+                else:
+                    tag_bt = "E"
+            else:
+                tag_bt = "E"
+
+            param = _resolve_sltp_by_tag(tag_bt, default_method=sltp_method, default_k_sl=k_sl, default_k_tp=k_tp, strat_sltps_override=strat_local)
+            # ensure A/C override if provided separately
+            if tag_bt in ("A","B"):
+                param["k_sl"] = strat_local["A"]["k_sl"]
+                param["k_tp"] = strat_local["A"]["k_tp"]
+            elif tag_bt in ("C","C′"):
+                param["k_sl"] = strat_local["C"]["k_sl"]
+                param["k_tp"] = strat_local["C"]["k_tp"]
+
+            sl, tp = make_sl_tp(entry_price, side, method=param["method"], atr=atr_ref, sl_pct=param.get("sl_pct"), tp_pct=param.get("tp_pct"), k_sl=param.get("k_sl"), k_tp=param.get("k_tp"), tick_size=0.0)
+        else:
+            if side in ("LONG","SHORT"):
+                side = "HOLD"
+
+        size = 0.0
+        used_lev = 0.0
+        if side in ("LONG", "SHORT") and entry_time is not None and entry_price is not None and sl:
+            size = float(eq_run) * float(max_leverage_local)
+            used_lev = float(max_leverage_local)
+
+        exit_time, exit_price, gross_ret, net_ret = (None, None, None, None)
+        if side in ("LONG", "SHORT") and entry_time is not None and entry_price is not None:
+            exit_time, exit_price, gross_ret, net_ret = simulate_trade(
+                df_roll, t_entry, pred_b["end"], side,
+                entry_time, entry_price, sl, tp,
+                fee_entry=fee_entry_local, fee_exit=fee_exit_local,
+                slip_entry=slip_entry_local, slip_exit=slip_exit_local,
+                exit_on_close=True
+            )
+        else:
+            if side in ("LONG","SHORT"):
+                side = "HOLD"
+
+        ret_pct = (net_ret or 0.0) / 100.0
+        eq_before = eq_run
+        pnl_usd = (size or 0.0) * ret_pct
+        eq_run = eq_run + pnl_usd
+        ret_equity_pct = (pnl_usd / (eq_before if eq_before > 0 else 1.0)) * 100.0
+
+        trade_logs.append({
+            "pred_start": pred_b["start"],
+            "pred_end": pred_b["end"],
+            "t_entry": t_entry,
+            "side": side,
+            "sim_prefix": best["sim"],
+            "scaler": "static",
+            "entry_time": entry_time,
+            "entry": entry_price,
+            "entry_target": entry_target,
+            "SL": sl,
+            "TP": tp,
+            "size_notional": size,
+            "used_lev": used_lev,
+            "cap_hit": False,
+            "exit_time": exit_time,
+            "exit": exit_price,
+            "gross_ret_%": gross_ret,
+            "net_ret_%": net_ret,
+            "eq_before": eq_before,
+            "eq_after": eq_run,
+            "pnl_usd": pnl_usd,
+            "ret_equity_%": ret_equity_pct,
+            "skip_reason": None,
+        })
+
+    if not trade_logs:
+        return pd.DataFrame([])
+    df_log = pd.DataFrame(trade_logs).sort_values("pred_start").reset_index(drop=True)
+    return df_log
+
+def evaluate_wrapper(params: dict) -> float:
+    """
+    Wrapper passed to tuner.run_bayes_opt as evaluate_fn.
+    According to user's choice, we use final equity (eq_after of last trade) as score.
+    If no trades, return 0.0
+    """
+    try:
+        # prepare args used by run_backtest_with_params
+        ROLL_START = pd.Timestamp("2025-01-01 00:00:00")
+        df_full = df_full_static  # use static dataset prepared earlier
+
+        df_log = run_backtest_with_params(
+            df_full_static_local=df_full,
+            params=params,
+            ROLL_START=ROLL_START,
+            equity_start=float(equity),
+            max_leverage_local=float(max_leverage),
+            fee_entry_local=float(fee_entry),
+            fee_exit_local=float(fee_exit),
+            slip_entry_local=float(slip_entry),
+            slip_exit_local=float(slip_exit),
+            step_hours_local=int(step_hours),
+            window_size_local=int(window_size),
+            topN_local=5,
+            exd_local=10,
+            hist_start_static_local=pd.Timestamp("2025-01-01 00:00:00"),
+            sim_engine_local=sim_engine,
+            A_sl_local=float(STRAT_SLTPS["A"]["k_sl"]),
+            A_tp_local=float(STRAT_SLTPS["A"]["k_tp"]),
+            C_sl_local=float(STRAT_SLTPS["C"]["k_sl"]),
+            C_tp_local=float(STRAT_SLTPS["C"]["k_tp"]),
+            sim_gate_base_local=float(sim_gate_base),
+            ENTRY_DELAY_HOURS_local=int(ENTRY_DELAY_HOURS),
+        )
+        if df_log is None or df_log.empty:
+            return 0.0
+        # final equity is eq_after of the last row
+        final_eq = float(df_log["eq_after"].iloc[-1])
+        # We convert final equity to a scalar score for optimizer.
+        # Option chosen: use final equity directly (higher is better).
+        return float(final_eq)
+    except Exception as e:
+        # If any unexpected error in evaluation, return 0.0 neutral baseline
+        # (tuner will still proceed)
+        print("evaluate_wrapper error:", e)
+        return 0.0
+
+# ---------------------------
+# 🔧 Bayesian Tuner (메타 모델) — UI / 실행부 수정
+# ---------------------------
+st.divider()
+st.header("🔧 최적 파라미터")
+with st.expander("학습 실행", expanded=False):
+    n_trials = st.slider("시도 횟수 (trials)", 10, 200, 40, 10)
+    seed     = st.number_input("Random Seed", 0, 9999, 42)
+
+    if st.button("🚀 튜닝 시작"):
+        # build param pool to pass into run_bayes_opt, but ensure evaluate_fn is passed explicitly
+        # Only allow allowed keys from signature of run_bayes_opt
+        _params = dict(
+            n_trials=int(n_trials),
+            n_init=8,
+            N_pool=3000,
+            topk=2,
+            random_seed=int(seed),
+            verbose=True,
+            log_path=None
+        )
+        sig = inspect.signature(run_bayes_opt)
+        allowed = {k: v for k, v in _params.items() if k in sig.parameters}
+
+        # run tuner
+        best, df_logs = run_bayes_opt(evaluate_wrapper, **allowed)
+
+        # 화면 출력
+        st.success(f"Best score(final equity): {best['score']:.3f}")
+        st.json(best["params"])
+        st.dataframe(df_logs, use_container_width=True)
+
+        # ✅ 다음 런에서도 남게 "임시 보관" (저장/적용은 블록 밖에서)
+        st.session_state["last_best_params"] = best["params"]
+        st.toast("최적 파라미터가 세션에 임시 저장되었습니다. 아래 '적용/저장' 섹션을 사용하세요.", icon="🧠")
+
+# --- 항상 보이는 적용/저장 섹션 (튜닝 블록 '밖') ---
+st.subheader("▶ 결과 적용/저장")
+
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    # 세션에 즉시 적용 (상단 토글로 전역 주입)
+    if st.button("✅ 즉시 사용"):
+        params = st.session_state.get("last_best_params")
+        if params:
+            st.session_state["tuned_params"] = params
+            st.success("세션 적용 완료. 상단 '🧠 튜닝값 사용(BO/Surrogate)' 토글 ON 시 전 구간에 반영됩니다.")
+        else:
+            st.error("먼저 '🚀 튜닝 시작'으로 결과를 생성하세요.")
+
+with col2:
+    # 파일로 저장 (스크립트 폴더 고정 경로)
+    if st.button("💾 파일로 저장(tuned_params.json)"):
+        params = st.session_state.get("last_best_params")
+        if params:
+            import json
+            from pathlib import Path
+            save_path = Path(__file__).parent / "tuned_params.json"
+            with open(save_path, "w", encoding="utf-8") as f:
+                json.dump(params, f, ensure_ascii=False, indent=2)
+            st.success(f"파일 저장 완료: {save_path}")
+            st.toast("저장 완료. 다음 실행에서도 자동 복원이 가능합니다.", icon="✅")
+        else:
+            st.error("먼저 '🚀 튜닝 시작'으로 결과를 생성하세요.")
+
+with col3:
+    # 파일에서 불러와 세션에 적용 (선택)
+    if st.button("📂 파일에서 불러오기"):
+        try:
+            import json
+            from pathlib import Path
+            load_path = Path(__file__).parent / "tuned_params.json"
+            if load_path.exists():
+                with open(load_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                st.session_state["tuned_params"] = loaded
+                st.session_state["last_best_params"] = loaded
+                st.success("파일에서 불러와 세션에 적용했습니다. 상단 토글 ON 시 즉시 반영됩니다.")
+            else:
+                st.error("tuned_params.json 파일이 없습니다. 먼저 저장하세요.")
+        except Exception as e:
+            st.error(f"불러오기 실패: {e}")
+
