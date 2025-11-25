@@ -30,6 +30,7 @@ from trading_utils import (
 from backtest_utils import build_equity_curve, calc_metrics
 from sklearn.metrics.pairwise import cosine_similarity
 from tuner import run_bayes_opt
+from extra import make_ddonly_fig
 
 # ---------------------------
 # 기본 UI 설정
@@ -135,17 +136,19 @@ if use_tuned and tuned:
 # BT-상승/6M-상승 공통 UI (수수료/SLTP 입력)
 # ---------------------------
 if sim_mode in ("BT-상승", "6M-상승"):
-    # 3개 열 (토글은 아래 줄로 뺌)
     colA, colB, colC = st.columns(3)
-
-    # 1번째 열: 유사도 방식 + SL/TP 입력
     with colA:
         sim_engine = st.selectbox("유사도 방식", ["DTW", "Cosine"], index=0, help="DTW 또는 Cosine.")
-        # 토글을 아래로 옮겼으므로, 여기서는 항상 입력을 받는다 (토글 ON이면 아래에서 값 주입)
         A_sl = st.number_input("A/B SL(×ATR)", 0.1, 50.0, 1.0, 0.1)
         A_tp = st.number_input("A/B TP(×ATR)", 0.1, 50.0, 2.5, 0.1)
         C_sl = st.number_input("C/C′ SL(×ATR)", 0.1, 50.0, 1.5, 0.1)
         C_tp = st.number_input("C/C′ TP(×ATR)", 0.1, 50.0, 1.5, 0.1)
+
+    if not use_tuned:
+        STRAT_SLTPS["A"]["k_sl"] = STRAT_SLTPS["B"]["k_sl"] = float(A_sl)
+        STRAT_SLTPS["A"]["k_tp"] = STRAT_SLTPS["B"]["k_tp"] = float(A_tp)
+        STRAT_SLTPS["C"]["k_sl"] = STRAT_SLTPS["C′"]["k_sl"] = float(C_sl)
+        STRAT_SLTPS["C"]["k_tp"] = STRAT_SLTPS["C′"]["k_tp"] = float(C_tp)
 
     # 2번째 열: 수수료/슬리피지
     with colB:
@@ -861,7 +864,7 @@ def show_bt_result(label_prefix: str, df_log: pd.DataFrame, base_equity: float):
 
     # --- Tag-wise summary ---
     if "tag" in df_log.columns:
-        
+        st.markdown("#### 태그별 수익")
         groups = []
         for t, g in df_log.groupby("tag"):
             d, eq = build_equity_curve(g, float(base_equity))
@@ -907,6 +910,11 @@ if sim_mode == "BT-상승":
         st.info("ROLLING 결과 없음")
         st.stop()
     show_bt_result("BT-상승", df_log, equity)
+    st.markdown("#### MDD 시각화")
+    if "df_log" in locals() and df_log is not None and len(df_log):
+        st.pyplot(make_ddonly_fig(df_log), clear_figure=True)
+    else:
+        st.info("표시할 트레이드 로그가 없습니다.")
 
 # =========================
 # 6M-상승
@@ -923,8 +931,12 @@ if sim_mode == "6M-상승":
         hist_start=CAND_HIST_START,
         params_override=None
     )
-
     show_bt_result("최근 6개월", df_log_6m, equity)
+    st.markdown("#### MDD 시각화")
+    if "df_log" in locals() and df_log is not None and len(df_log):
+        st.pyplot(make_ddonly_fig(df_log), clear_figure=True)
+    else:
+        st.info("표시할 트레이드 로그가 없습니다.")
 
 # =========================
 # 오늘의 운세 + (튜너 병합)
@@ -965,8 +977,6 @@ if sim_mode == "튜닝·운세":
     # 🌙 운세 UI
     # ======================
     st.title("🔮 오늘의 운세 자동 연결")
-    st.write("생년월일을 입력하면 별자리/띠를 계산해서 링크를 보여줍니다.")
-
     birth_date = st.date_input("🎂 생년월일 입력", value=date(2000, 1, 1))
 
     if st.button("오늘의 운세 보기"):

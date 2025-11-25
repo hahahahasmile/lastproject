@@ -65,4 +65,3 @@ def window_vector(df_window, L=18):
         X[:, j] = 0.0 if vmax <= vmin else (v - vmin) / (vmax - vmin)
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
     return X.reshape(-1)
-
