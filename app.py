@@ -36,7 +36,7 @@ from extra import make_ddonly_fig
 # 기본 UI 설정
 # ---------------------------
 st.set_page_config(page_title="BTC 패턴매칭 전략 스튜디오", page_icon="📊", layout="wide")
-st.title("📈 BTC 패턴매칭 전략 스튜디오")
+st.title(" BTC 패턴매칭 전략 스튜디오")
 
 # ---------------------------
 # 공통 하이퍼파라미터 (기본값)
@@ -131,7 +131,49 @@ if use_tuned and tuned:
         f"A/B k_sl={STRAT_SLTPS['A']['k_sl']:.2f}, k_tp={STRAT_SLTPS['A']['k_tp']:.2f}, "
         f"C/C′ k_sl={STRAT_SLTPS['C']['k_sl']:.2f}, k_tp={STRAT_SLTPS['C']['k_tp']:.2f}"
     )
+# ---------------------------
+# NOW-상승 전용 SL/TP 입력 (튜닝값 미사용 시)
+# ---------------------------
+if (sim_mode == "NOW-상승") and (not use_tuned):
+    colA_now, colB_now = st.columns(2)
 
+    with colA_now:
+        A_sl = st.number_input(
+            "A/B SL(×ATR)",
+            0.1, 50.0,
+            float(STRAT_SLTPS["A"]["k_sl"]),
+            0.1,
+            help="NOW-상승에서 A/B 전략의 손절 배수(ATR 기준)"
+        )
+        A_tp = st.number_input(
+            "A/B TP(×ATR)",
+            0.1, 50.0,
+            float(STRAT_SLTPS["A"]["k_tp"]),
+            0.1,
+            help="NOW-상승에서 A/B 전략의 익절 배수(ATR 기준)"
+        )
+
+    with colB_now:
+        C_sl = st.number_input(
+            "C/C′ SL(×ATR)",
+            0.1, 50.0,
+            float(STRAT_SLTPS["C"]["k_sl"]),
+            0.1,
+            help="NOW-상승에서 C/C′ 전략의 손절 배수(ATR 기준)"
+        )
+        C_tp = st.number_input(
+            "C/C′ TP(×ATR)",
+            0.1, 50.0,
+            float(STRAT_SLTPS["C"]["k_tp"]),
+            0.1,
+            help="NOW-상승에서 C/C′ 전략의 익절 배수(ATR 기준)"
+        )
+
+    # 입력값을 전역 STRAT_SLTPS에 반영
+    STRAT_SLTPS["A"]["k_sl"] = STRAT_SLTPS["B"]["k_sl"] = float(A_sl)
+    STRAT_SLTPS["A"]["k_tp"] = STRAT_SLTPS["B"]["k_tp"] = float(A_tp)
+    STRAT_SLTPS["C"]["k_sl"] = STRAT_SLTPS["C′"]["k_sl"] = float(C_sl)
+    STRAT_SLTPS["C"]["k_tp"] = STRAT_SLTPS["C′"]["k_tp"] = float(C_tp)
 # ---------------------------
 # BT-상승/6M-상승 공통 UI (수수료/SLTP 입력)
 # ---------------------------
@@ -330,7 +372,7 @@ if sim_mode == "NOW-상승":
             (float(df_best_next["close"].iloc[L - 1]) if len(df_best_next) >= L and L > 0 else float(df_best_next["close"].iloc[-1]))
         )
     )
-    st.markdown("### ⏱️ 시간 정보")
+    st.markdown("###  시간 정보")
     st.write({"현재 블록 구간": f"{pred_start} ~ {pred_end}"})
 
     fig, ax = plt.subplots(figsize=(9, 3))
@@ -395,9 +437,9 @@ if sim_mode == "NOW-상승":
     if best["sim"] < sim_gate:
         current_scenario = "E"
 
-    st.markdown(f"### 📌 현재 판정: **{current_scenario} 시나리오**")
+    st.markdown(f"###  현재 판정: **{current_scenario} 시나리오**")
     st.caption(f"현재 유사도 = {best['sim']:.3f} / 게이트 = {sim_gate_base:.2f}")
-    st.write(f"🕒 현재 데이터 최신 시점: {now_ts}")
+    st.write(f" 현재 데이터 최신 시점: {now_ts}")
 
     STRAT_DESC = {
         "A": "강한 상승: HI_THR 이상 & 상승우위 & 비하락레짐 → 다음봉 시가 LONG",
@@ -942,69 +984,99 @@ if sim_mode == "6M-상승":
 # 오늘의 운세 + (튜너 병합)
 # =========================
 if sim_mode == "튜닝·운세":
-    # ======================
-    # 🔮 별자리 계산 함수
-    # ======================
-    def get_zodiac(month, day):
-        zodiac_dates = [
-            ((1, 20), "물병자리"),
-            ((2, 19), "물고기자리"),
-            ((3, 21), "양자리"),
-            ((4, 20), "황소자리"),
-            ((5, 21), "쌍둥이자리"),
-            ((6, 22), "게자리"),
-            ((7, 23), "사자자리"),
-            ((8, 23), "처녀자리"),
-            ((9, 23), "천칭자리"),
-            ((10, 23), "전갈자리"),
-            ((11, 23), "사수자리"),
-            ((12, 25), "염소자리")
-        ]
-        for (m, d), sign in zodiac_dates:
-            if (month, day) >= (m, d):
-                return sign
-        return "염소자리"
+    df_full = df_full_static
+    now_ts = df_full["timestamp"].iloc[-1]
 
-    # ======================
-    # 🐲 띠 계산 함수
-    # ======================
-    def get_chinese_zodiac(year):
-        animals = ["원숭이", "닭", "개", "돼지", "쥐", "소",
-                   "호랑이", "토끼", "용", "뱀", "말", "양"]
-        return animals[year % 12]
+    # 제목은 심플하게
+    st.header("운세")
 
-    # ======================
-    # 🌙 운세 UI
-    # ======================
-    st.title("🔮 오늘의 운세 자동 연결")
-    birth_date = st.date_input("🎂 생년월일 입력", value=date(2000, 1, 1))
+    # -------------------------
+    # 변동성 · 펀딩 컨디션 블록
+    # -------------------------
+    horizon_h = int(ENTRY_DELAY_HOURS)  # 기본 32h 구간
+    cut_h = now_ts - pd.Timedelta(hours=horizon_h)
+    seg_h = df_full[df_full["timestamp"] >= cut_h]
 
-    if st.button("오늘의 운세 보기"):
-        year = birth_date.year
-        month = birth_date.month
-        day = birth_date.day
+    if len(seg_h) < 2 or df_full["log_ret"].std(ddof=0) == 0:
+        st.info("컨디션 점수를 계산하기 위한 데이터가 부족합니다.")
+    else:
+        # --- 변동성 비율 ---
+        vol_recent = float(seg_h["log_ret"].std(ddof=0))
+        vol_all = float(df_full["log_ret"].std(ddof=0))
+        vol_ratio = vol_recent / vol_all if vol_all > 0 else 1.0
 
-        zodiac = get_zodiac(month, day)
-        animal = get_chinese_zodiac(year)
+        # --- 펀딩 z-score ---
+        if "funding" in df_full.columns:
+            fund_recent = float(seg_h["funding"].mean())
+            fund_mu = float(df_full["funding"].mean())
+            fund_sd = float(df_full["funding"].std(ddof=0))
+            funding_z = 0.0 if fund_sd == 0 else (fund_recent - fund_mu) / fund_sd
+        else:
+            funding_z = 0.0
 
-        st.subheader("✨ 당신의 정보")
-        st.write(f"📅 생일: {birth_date}")
-        st.write(f"🌠 별자리: **{zodiac}**")
-        st.write(f"🐉 띠: **{animal}띠**")
+        # --- 점수 계산: 0 ~ 100 ---
+        base = 50.0 * (vol_ratio - 1.0)          # 변동성이 평소보다 높으면 +, 낮으면 -
+        base = max(-50.0, min(50.0, base))
+        penalty = min(30.0, 15.0 * abs(funding_z))   # 펀딩 쏠림이 크면 감점
+        score = base - penalty + 50.0                # 중앙 50 기준
+        score = max(0.0, min(100.0, score))
 
-        fortune_link = f"https://search.naver.com/search.naver?query={zodiac}+오늘의+운세"
-        st.markdown(f"👉 [네이버에서 {zodiac} 오늘의 운세 보기]({fortune_link})", unsafe_allow_html=True)
+        # --- 레짐 분류 ---
+        if vol_ratio <= 0.8:
+            vol_regime = "저변동"
+        elif vol_ratio >= 1.2:
+            vol_regime = "고변동"
+        else:
+            vol_regime = "보통"
 
-        fortune_link2 = f"https://search.naver.com/search.naver?query={animal}띠+오늘의+운세"
-        st.markdown(f"👉 [네이버에서 {animal}띠 오늘의 운세 보기]({fortune_link2})", unsafe_allow_html=True)
+        abs_fz = abs(funding_z)
+        if funding_z >= 0.7:
+            funding_regime = "롱 과열"
+        elif funding_z <= -0.7:
+            funding_regime = "숏 과열"
+        else:
+            funding_regime = "중립"
 
-    st.caption("💡 네이버 검색 결과 페이지로 이동합니다.")
+        # --- 시장 컨디션 코멘트 (comment 느낌) ---
+        if score >= 70:
+            score_comment = "시장 컨디션: 양호 — 평소 수준 이상으로 공격적인 진입도 고려 가능."
+        elif score >= 40:
+            score_comment = "시장 컨디션: 보통 — 기본 전략대로 운용하는 구간."
+        else:
+            score_comment = "시장 컨디션: 불리 — 진입·레버리지를 보수적으로 가져가는 편이 안전한 구간."
 
-    # ======================
-    # 🔧 튜너 (이 섹션을 '오늘의 운세' 내부로 병합)
-    # ======================
-    st.divider()
-    st.header("🔧 최적 파라미터")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric(
+                "시장 컨디션 점수",
+                f"{score:.1f} / 100",
+                help=(
+                    f"최근 {horizon_h}시간의 변동성·펀딩 상태를 0~100으로 스케일한 값입니다. "
+                    "50이 과거 평균 수준, 낮을수록 보수적인 대응이 권장되는 구간입니다."
+                ),
+            )
+        with col2:
+            st.metric(
+                "변동성 레짐",
+                vol_regime,
+                f"{vol_ratio:.2f}x",
+                help=(
+                    "최근 로그수익률 표준편차 / 전체 기간 표준편차 비율입니다. "
+                    "0.8 이하: 저변동, 0.8~1.2: 보통, 1.2 이상: 고변동."
+                ),
+            )
+        with col3:
+            st.metric(
+                "펀딩 레짐",
+                funding_regime,
+                f"|z| = {abs_fz:.2f}",
+                help=(
+                    "최근 구간 펀딩비를 전체 평균/표준편차로 z-score화한 값입니다. "
+                    "절댓값이 클수록 한쪽 포지션(롱/숏) 쏠림이 강한 상태를 의미합니다."
+                ),
+            )
+    st.markdown(f"{score_comment}")
+    st.header(" 최적 파라미터")
 
     with st.expander("학습 실행 (최근 6개월 고정)", expanded=False):
         n_trials = st.slider("시도 횟수 (trials)", 10, 200, 40, 10)
@@ -1049,7 +1121,7 @@ if sim_mode == "튜닝·운세":
                 print("evaluate_wrapper error:", e)
                 return 0.0
 
-        if st.button("🚀 튜닝 시작"):
+        if st.button(" 튜닝 시작"):
             _params = dict(
                 n_trials=int(n_trials),
                 n_init=8,
