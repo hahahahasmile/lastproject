@@ -64,10 +64,10 @@ colA, colB, colC = st.columns(3)
 with colA:
     sim_mode = st.radio(
         "모드",
-        ["NOW-상승", "BT-상승", "6M-상승", "튜닝·운세"],
+        ["현재구간", "백테스트", "백테스트1", "튜닝·운세", "백테스트뷰"],
         index=0,
         horizontal=True,
-        help="NOW-상승: 단일·32h / BT-상승: 고정 시계열 백테스트 / 6M-상승: 최근 6개월 백테스트"
+        help="현재구간: 단일·32h / 백테스트: 고정 시계열 백테스트 / 백테스트1: 최근 6개월 백테스트"
     )
 
 sim_engine = "DTW"
@@ -106,8 +106,35 @@ def _load_tuned_params_into_session():
 
 
 _loaded_tp = _load_tuned_params_into_session()
+# ---------------------------
+# 속도 개선
+# ---------------------------
+@st.cache_data(show_spinner=False)
+def load_all_data():
+    client = connect_binance()
+    df_raw = fetch_futures_4h_klines(client, start_time="2020-01-01")
+    df_funding = fetch_funding_rate(client, start_time="2020-01-01")
+    df_feat = add_features(df_raw, df_funding)
 
+    train_end_ts_static = pd.Timestamp("2022-07-01 00:00:00")
+    df_full_static = apply_static_zscore(df_feat, GLOBAL_Z_COLS, train_end_ts_static)
+    df_full_static = finalize_preprocessed(df_full_static, window_size)
+    return df_full_static
 
+@st.cache_data(show_spinner=False)
+def cached_blocks(df, step_hours, window_size):
+    return enumerate_blocks(df, step_hours=step_hours, window_size=window_size)
+
+@st.cache_data(show_spinner=False)
+def cached_vectors(df, step_hours, window_size):
+    blocks = enumerate_blocks(df, step_hours=step_hours, window_size=window_size)
+    out = []
+    for b in blocks:
+        w = df[(df["timestamp"] >= b["start"]) & (df["timestamp"] < b["end"])]
+        if len(w) >= window_size:
+            v = window_vector(w.iloc[:window_size], L=window_size)
+            out.append((b, v))
+    return out
 # ---------------------------
 # 튜닝값 사용 토글 + 전역 주입
 # ---------------------------
@@ -132,9 +159,9 @@ if use_tuned and tuned:
         f"C/C′ k_sl={STRAT_SLTPS['C']['k_sl']:.2f}, k_tp={STRAT_SLTPS['C']['k_tp']:.2f}"
     )
 # ---------------------------
-# NOW-상승 전용 SL/TP 입력 (튜닝값 미사용 시)
+# 현재구간 전용 SL/TP 입력 (튜닝값 미사용 시)
 # ---------------------------
-if (sim_mode == "NOW-상승") and (not use_tuned):
+if (sim_mode == "현재구간") and (not use_tuned):
     colA_now, colB_now = st.columns(2)
 
     with colA_now:
@@ -143,14 +170,14 @@ if (sim_mode == "NOW-상승") and (not use_tuned):
             0.1, 50.0,
             float(STRAT_SLTPS["A"]["k_sl"]),
             0.1,
-            help="NOW-상승에서 A/B 전략의 손절 배수(ATR 기준)"
+            help="현재구간에서 A/B 전략의 손절 배수(ATR 기준)"
         )
         A_tp = st.number_input(
             "A/B TP(×ATR)",
             0.1, 50.0,
             float(STRAT_SLTPS["A"]["k_tp"]),
             0.1,
-            help="NOW-상승에서 A/B 전략의 익절 배수(ATR 기준)"
+            help="현재구간에서 A/B 전략의 익절 배수(ATR 기준)"
         )
 
     with colB_now:
@@ -159,14 +186,14 @@ if (sim_mode == "NOW-상승") and (not use_tuned):
             0.1, 50.0,
             float(STRAT_SLTPS["C"]["k_sl"]),
             0.1,
-            help="NOW-상승에서 C/C′ 전략의 손절 배수(ATR 기준)"
+            help="현재구간에서 C/C′ 전략의 손절 배수(ATR 기준)"
         )
         C_tp = st.number_input(
             "C/C′ TP(×ATR)",
             0.1, 50.0,
             float(STRAT_SLTPS["C"]["k_tp"]),
             0.1,
-            help="NOW-상승에서 C/C′ 전략의 익절 배수(ATR 기준)"
+            help="현재구간에서 C/C′ 전략의 익절 배수(ATR 기준)"
         )
 
     # 입력값을 전역 STRAT_SLTPS에 반영
@@ -175,9 +202,9 @@ if (sim_mode == "NOW-상승") and (not use_tuned):
     STRAT_SLTPS["C"]["k_sl"] = STRAT_SLTPS["C′"]["k_sl"] = float(C_sl)
     STRAT_SLTPS["C"]["k_tp"] = STRAT_SLTPS["C′"]["k_tp"] = float(C_tp)
 # ---------------------------
-# BT-상승/6M-상승 공통 UI (수수료/SLTP 입력)
+# 백테스트/백테스트1 공통 UI (수수료/SLTP 입력)
 # ---------------------------
-if sim_mode in ("BT-상승", "6M-상승"):
+if sim_mode in ("백테스트", "백테스트1"):
     colA, colB, colC = st.columns(3)
     with colA:
         sim_engine = st.selectbox("유사도 방식", ["DTW", "Cosine"], index=0, help="DTW 또는 Cosine.")
@@ -208,14 +235,7 @@ if sim_mode in ("BT-상승", "6M-상승"):
 # 데이터 로드 & 전처리
 # ---------------------------
 
-client = connect_binance()
-df_raw = fetch_futures_4h_klines(client, start_time="2020-01-01")
-df_funding = fetch_funding_rate(client, start_time="2020-01-01")
-df_feat = add_features(df_raw, df_funding)
-
-train_end_ts_static = pd.Timestamp("2022-07-01 00:00:00")
-df_full_static = apply_static_zscore(df_feat.copy(), GLOBAL_Z_COLS, train_end_ts_static)
-df_full_static = finalize_preprocessed(df_full_static, window_size)
+df_full_static = load_all_data()
 
 if len(df_full_static) < window_size:
     st.error("데이터가 부족합니다.")
@@ -235,26 +255,25 @@ def get_candidates(df, ref_range, ex_margin_days=5, topN=10, past_only=False):
     if not window_is_finite(wL):
         return []
     vec_ref = window_vector(wL, L=window_size)
-    blocks = enumerate_blocks(df, step_hours=step_hours, window_size=window_size)
+    blocks_cached = cached_vectors(df, step_hours, window_size)  
     ex_margin = pd.Timedelta(days=ex_margin_days)
     F = len(FEAT_COLS)
     cand = []
-    for b in blocks:
+    for b, vec_hist in blocks_cached:
         if past_only:
             if not (b["end"] <= ref_range[0] - ex_margin):
                 continue
         else:
             if not ((b["end"] <= ref_range[0] - ex_margin) or (b["start"] >= ref_range[1] + ex_margin)):
                 continue
-        w = df[(df["timestamp"] >= b["start"]) & (df["timestamp"] < b["end"])]
-        if len(w) < window_size:
-            continue
-        wL2 = w.iloc[:window_size]
-        if not window_is_finite(wL2):
-            continue
-        vec_hist = window_vector(wL2, L=window_size)
-        sim = sim_tier3(vec_ref, vec_hist, L=window_size, F=F, mode=sim_engine, w_dtw=w_dtw)
-        cand.append({"start": b["start"], "end": b["end"], "sim": sim})
+        sim = sim_tier3(vec_ref, vec_hist, L=window_size, F=F,
+                        mode=sim_engine, w_dtw=w_dtw)
+
+        cand.append({
+            "start": b["start"],
+            "end": b["end"],
+            "sim": sim
+        })
     cand.sort(key=lambda x: x["sim"], reverse=True)
     return cand[:topN]
 
@@ -310,10 +329,10 @@ def _resolve_sltp_by_tag(tag: str, default_method: str, default_k_sl: float, def
 
 
 # =========================
-# NOW-상승
+# 현재구간
 # =========================
-if sim_mode == "NOW-상승":
-    df_full = df_full_static
+if sim_mode == "현재구간":
+    df_full = df_full_static[df_full_static["timestamp"] >= pd.Timestamp("2025-01-01 00:00:00")]
 
     cands = get_candidates(
         df_full, (ref_start, ref_end), ex_margin_days=10, topN=5, past_only=True
@@ -383,7 +402,7 @@ if sim_mode == "NOW-상승":
     ax.axhline(HI_THR, ls="--"); ax.axhline(-HI_THR, ls="--")
     ax.axhline(LO_THR, ls=":"); ax.axhline(-LO_THR, ls=":")
     ax.axhline(0, ls=":")
-    ax.set_title("NOW-상승: 32h 기준 · 진행 vs 매칭 ")
+    ax.set_title("현재구간: 32h 기준 · 진행 vs 매칭 ")
     ax.legend(); ax.grid(True, alpha=0.3)
     st.pyplot(fig)
 
@@ -600,7 +619,7 @@ def run_backtest_with_params(
     if len(df_roll) < window_size_local:
         return pd.DataFrame([])
 
-    blocks_all = enumerate_blocks(df_roll, step_hours=step_hours_local, window_size=window_size_local)
+    blocks_all = cached_blocks(df_roll, step_hours, window_size)
 
     start_idx = None
     for i in range(1, len(blocks_all)):
@@ -860,7 +879,16 @@ def run_bt_for_range(roll_start: pd.Timestamp, hist_start: pd.Timestamp, params_
         sim_gate_base_local=float(sim_gate_base),
         ENTRY_DELAY_HOURS_local=int(ENTRY_DELAY_HOURS),
     )
+def run_bt_solo_log():
+    ROLL_START = pd.Timestamp("2025-01-01 00:00:00")
 
+    df_log = run_bt_for_range(
+        roll_start=ROLL_START,
+        hist_start=ROLL_START,
+        params_override=None
+    )
+
+    return df_log
 
 def get_roll_start_6m(df: pd.DataFrame):
     last_ts_local = df["timestamp"].iloc[-1]
@@ -926,14 +954,14 @@ def show_bt_result(label_prefix: str, df_log: pd.DataFrame, base_equity: float):
             st.dataframe(pd.DataFrame(groups).sort_values("tag"), use_container_width=True)
 
 # =========================
-# BT-상승
+# 백테스트
 # =========================
-if sim_mode == "BT-상승":
+if sim_mode == "백테스트":
     ROLL_START = pd.Timestamp("2025-01-01 00:00:00")
 
     df_roll_base = df_full_static[df_full_static["timestamp"] >= (ROLL_START - pd.Timedelta(hours=72))].reset_index(drop=True)
     if len(df_roll_base) < window_size:
-        st.warning("BT-상승: 데이터 부족")
+        st.warning("백테스트: 데이터 부족")
         st.stop()
     blocks_all = enumerate_blocks(df_roll_base, step_hours=step_hours, window_size=window_size)
 
@@ -943,7 +971,7 @@ if sim_mode == "BT-상승":
             start_idx = i
             break
     if start_idx is None:
-        st.warning("BT-상승: 2025년 이후 pred 블록 없음")
+        st.warning("백테스트: 2025년 이후 pred 블록 없음")
         st.stop()
 
     df_log = run_bt_for_range(ROLL_START, pd.Timestamp("2025-01-01 00:00:00"))
@@ -951,7 +979,7 @@ if sim_mode == "BT-상승":
     if df_log is None or df_log.empty:
         st.info("ROLLING 결과 없음")
         st.stop()
-    show_bt_result("BT-상승", df_log, equity)
+    show_bt_result("백테스트", df_log, equity)
     st.markdown("#### MDD 시각화")
     if "df_log" in locals() and df_log is not None and len(df_log):
         st.pyplot(make_ddonly_fig(df_log), clear_figure=True)
@@ -959,9 +987,9 @@ if sim_mode == "BT-상승":
         st.info("표시할 트레이드 로그가 없습니다.")
 
 # =========================
-# 6M-상승
+# 백테스트1
 # =========================
-if sim_mode == "6M-상승":
+if sim_mode == "백테스트1":
     ROLL_START_6M = get_roll_start_6m(df_full_static)
 
     # 이 블록 내부에서만 사용할 후보풀 시작 시점
@@ -974,11 +1002,6 @@ if sim_mode == "6M-상승":
         params_override=None
     )
     show_bt_result("최근 6개월", df_log_6m, equity)
-    st.markdown("#### MDD 시각화")
-    if "df_log" in locals() and df_log is not None and len(df_log):
-        st.pyplot(make_ddonly_fig(df_log), clear_figure=True)
-    else:
-        st.info("표시할 트레이드 로그가 없습니다.")
 
 # =========================
 # 오늘의 운세 + (튜너 병합)
@@ -1153,6 +1176,45 @@ if sim_mode == "튜닝·운세":
                 with open(save_path, "w", encoding="utf-8") as f:
                     json.dump(best["params"], f, ensure_ascii=False, indent=2)
                 st.toast(f"최적 파라미터 자동 저장 완료: {save_path}", icon="✅")
-                st.caption("상단 '🧠 튜닝값 사용' 토글을 켜면 전역에 즉시 반영됩니다.")
+                st.caption("상단 ' 튜닝값 사용' 토글을 켜면 전역에 즉시 반영됩니다.")
             except Exception as e:
                 st.warning(f"자동 저장 실패: {e}")
+if sim_mode == "백테스트뷰":
+    df_log = run_bt_solo_log()
+    if df_log is None or df_log.empty:
+        st.error("백테스트 거래 로그 없음")
+        st.stop()
+
+    # side가 아니라 tag로 필터
+    df_real = df_log[
+        df_log["tag"].isin(["A", "B", "C", "C′"]) &
+        df_log["exit_time"].notna()
+    ].reset_index(drop=True)
+
+    if df_real.empty:
+        st.info("리뷰할 거래 없음")
+        st.stop()
+
+    pick = st.selectbox(
+        "리뷰할 거래 선택",
+        options=df_real.index,
+        format_func=lambda i: f"{df_real.loc[i, 't_entry']} | {df_real.loc[i, 'side']} | {df_real.loc[i, 'net_ret_%']:.2f}%"
+    )
+
+    row = df_real.loc[pick]
+
+    seg = df_full_static[
+        (df_full_static["timestamp"] >= row["t_entry"] - pd.Timedelta(hours=24)) &
+        (df_full_static["timestamp"] <= row["exit_time"] + pd.Timedelta(hours=24))
+    ].reset_index(drop=True)
+
+    base = seg["close"].iloc[0]
+    pct = (seg["close"] / base - 1) * 100
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.plot(seg["timestamp"], pct, linewidth=2)
+
+    ax.scatter(row["t_entry"], (row["entry"] / base - 1) * 100, s=120, color="green")
+    ax.scatter(row["exit_time"], (row["exit"] / base - 1) * 100, s=120, color="red")
+
+    st.pyplot(fig)
