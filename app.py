@@ -67,7 +67,7 @@ with colA:
         ["현재구간", "백테스트", "백테스트1", "튜닝·운세", "백테스트뷰"],
         index=0,
         horizontal=True,
-        help="현재구간: 단일·32h / 백테스트: 고정 시계열 백테스트 / 백테스트1: 최근 6개월 백테스트"
+        help="현재구간: 단일·32h / 백테스트: 고정 시계열 백테스트 / 백테스트1: 최근 6개월 백테스트 / 튜닝·운세: 시장상황을 간단 지표로 보여주고 최적 파라미터 계산 / 백테스트뷰: 과거 거래 흐름을 시각적으로 확인"
     )
 
 sim_engine = "DTW"
@@ -207,11 +207,11 @@ if (sim_mode == "현재구간") and (not use_tuned):
 if sim_mode in ("백테스트", "백테스트1"):
     colA, colB, colC = st.columns(3)
     with colA:
-        sim_engine = st.selectbox("유사도 방식", ["DTW", "Cosine"], index=0, help="DTW 또는 Cosine.")
-        A_sl = st.number_input("A/B SL(×ATR)", 0.1, 50.0, 1.0, 0.1)
-        A_tp = st.number_input("A/B TP(×ATR)", 0.1, 50.0, 2.5, 0.1)
-        C_sl = st.number_input("C/C′ SL(×ATR)", 0.1, 50.0, 1.5, 0.1)
-        C_tp = st.number_input("C/C′ TP(×ATR)", 0.1, 50.0, 1.5, 0.1)
+        sim_engine = st.selectbox("유사도 방식", ["DTW", "Cosine"], index=0, help="DTW: 시간 변형을 허용한 패턴 유사도 / Cosine: 방향성 중심 유사도")
+        A_sl = st.number_input("A/B SL(×ATR)", 0.1, 50.0, 1.0, 0.1,help="A/B 전략 손절 폭: ATR의 몇 배까지 역행하면 손절할지 설정")
+        A_tp = st.number_input("A/B TP(×ATR)", 0.1, 50.0, 2.5, 0.1,help="A/B 전략 익절 폭: ATR의 몇 배 수익에서 익절할지 설정")
+        C_sl = st.number_input("C/C′ SL(×ATR)", 0.1, 50.0, 1.5, 0.1,help="C/C′ 전략 손절 폭: ATR의 몇 배까지 역행하면 손절할지 설정")
+        C_tp = st.number_input("C/C′ TP(×ATR)", 0.1, 50.0, 1.5, 0.1,help="C/C′ 전략 익절 폭: ATR의 몇 배 수익에서 익절할지 설정")
 
     if not use_tuned:
         STRAT_SLTPS["A"]["k_sl"] = STRAT_SLTPS["B"]["k_sl"] = float(A_sl)
@@ -221,15 +221,15 @@ if sim_mode in ("백테스트", "백테스트1"):
 
     # 2번째 열: 수수료/슬리피지
     with colB:
-        fee_entry = st.number_input("진입 수수료(%)", 0.0, 1.0, 0.04, 0.01) / 100.0
-        fee_exit  = st.number_input("청산 수수료(%)", 0.0, 1.0, 0.05, 0.01) / 100.0
-        slip_entry = st.number_input("진입 슬리피지(%)", 0.0, 0.5, 0.03, 0.01) / 100.0
-        slip_exit  = st.number_input("청산 슬리피지(%)", 0.0, 0.5, 0.05, 0.01) / 100.0
+        fee_entry = st.number_input("진입 수수료(%)", 0.0, 1.0, 0.04, 0.01,help="롱/숏 포지션을 새로 잡을 때 거래소에 내는 수수료") / 100.0
+        fee_exit  = st.number_input("청산 수수료(%)", 0.0, 1.0, 0.05, 0.01,help="포지션을 종료(청산)할 때 거래소에 내는 수수료") / 100.0
+        slip_entry = st.number_input("진입 슬리피지(%)", 0.0, 0.5, 0.03, 0.01,help="주문 가격보다 불리한 가격에 진입될 수 있는 오차(미끄러짐)") / 100.0
+        slip_exit  = st.number_input("청산 슬리피지(%)", 0.0, 0.5, 0.05, 0.01,help="예상 청산 가격보다 불리한 가격으로 체결될 수 있는 오차") / 100.0
 
     # 3번째 열: 가상 Equity/레버리지
     with colC:
-        equity = st.number_input("가상 Equity (USDT)", 10.0, value=1000.0, step=10.0)
-        max_leverage = st.number_input("최대 레버리지(x)", 1.0, 50.0, 10.0, 1.0)
+        equity = st.number_input("가상 Equity (USDT)", 10.0, value=1000.0, step=10.0,help="백테스트·시뮬레이션에 사용할 초기 자본(가상의 계좌 잔고)")
+        max_leverage = st.number_input("최대 레버리지(x)", 1.0, 50.0, 10.0, 1.0,help="포지션을 잡을 때 적용할 최대 배율로, 포지션 크기 계산에 사용")
 
 # ---------------------------
 # 데이터 로드 & 전처리
@@ -332,7 +332,7 @@ def _resolve_sltp_by_tag(tag: str, default_method: str, default_k_sl: float, def
 # 현재구간
 # =========================
 if sim_mode == "현재구간":
-    df_full = df_full_static[df_full_static["timestamp"] >= pd.Timestamp("2025-01-01 00:00:00")]
+    df_full = df_full_static[df_full_static["timestamp"] >= pd.Timestamp("2025-01-01 00:00:00")].reset_index(drop=True)
 
     cands = get_candidates(
         df_full, (ref_start, ref_end), ex_margin_days=10, topN=5, past_only=True
@@ -1102,8 +1102,10 @@ if sim_mode == "튜닝·운세":
     st.header(" 최적 파라미터")
 
     with st.expander("학습 실행 (최근 6개월 고정)", expanded=False):
-        n_trials = st.slider("시도 횟수 (trials)", 10, 200, 40, 10)
-        seed = st.number_input("Random Seed", 0, 9999, 42)
+        n_trials = st.slider("시도 횟수 (trials)", 10, 200, 40, 10,
+                             help="튜닝을 몇 회 반복할지 설정합니다. 반복 수가 많을수록 더 정교한 값 탐색.")
+        seed = st.number_input("Random Seed", 0, 9999, 42,
+                               help="튜닝 결과를 재현 가능하게 만드는 난수 고정값입니다.")
 
         # ⚠️ 외부 새 함수 안 씀. 이미 있는 df_full_static / run_backtest_with_params만 사용.
         def evaluate_wrapper(params: dict) -> float:
@@ -1198,7 +1200,8 @@ if sim_mode == "백테스트뷰":
     pick = st.selectbox(
         "리뷰할 거래 선택",
         options=df_real.index,
-        format_func=lambda i: f"{df_real.loc[i, 't_entry']} | {df_real.loc[i, 'side']} | {df_real.loc[i, 'net_ret_%']:.2f}%"
+        format_func=lambda i: f"{df_real.loc[i, 't_entry']} | {df_real.loc[i, 'side']} | {df_real.loc[i, 'net_ret_%']:.2f}%",
+        help="백테스트에서 실제로 실행된 거래 중 하나를 선택해 상세 구간을 확인합니다."
     )
 
     row = df_real.loc[pick]
